@@ -447,3 +447,109 @@ async fn unpersisted_changes_are_reported_as_such() {
     let (_, body) = common::http(api, "GET", "/api/v1/info", None, None).await;
     assert!(body.contains("\"persistent\":false"), "body was {body}");
 }
+
+#[tokio::test]
+async fn api_reports_which_entries_are_denying_traffic() {
+    let settings = common::test_settings_with_deny_lists(
+        vec![HOTSPOT_A.to_string()],
+        vec!["EU868".to_string(), "KR920".to_string()],
+    );
+    let grpc_addr = common::available_port().await;
+    let (_shutdown, api) = common::start_server_with_api(&settings, grpc_addr).await;
+    let mut client = common::connect_client(grpc_addr).await;
+
+    // Before any traffic, every rule reports as unused.
+    let (_, body) = common::http(api, "GET", "/api/v1/deny-list/regions", None, None).await;
+    assert!(body.contains("\"denied\":0"), "body was {body}");
+    assert!(body.contains("\"never_matched\":2"), "body was {body}");
+
+    // Three EU868 denials, one hotspot denial in an allowed region, one allowed.
+    for i in 0..3 {
+        let res = common::inc(
+            &mut client,
+            &format!("eu-{i}"),
+            vec![],
+            Region::Eu868 as i32,
+        )
+        .await;
+        assert!(res.denied);
+    }
+    let res = common::inc(
+        &mut client,
+        "hs",
+        HOTSPOT_A.as_bytes().to_vec(),
+        Region::Au915 as i32,
+    )
+    .await;
+    assert!(res.denied);
+    let res = common::inc(&mut client, "ok", vec![], Region::Au915 as i32).await;
+    assert!(!res.denied);
+
+    let regions: serde_json::Value = serde_json::from_str(
+        &common::http(api, "GET", "/api/v1/deny-list/regions", None, None)
+            .await
+            .1,
+    )
+    .unwrap();
+
+    assert_eq!(regions["activity_since_start"]["denied"], 3);
+    // KR920 was configured but never matched — the thing worth spotting.
+    assert_eq!(regions["activity_since_start"]["never_matched"], 1);
+
+    // Busiest first, with a timestamp on the entry that matched.
+    assert_eq!(regions["regions"][0]["region"], "EU868");
+    assert_eq!(regions["regions"][0]["hits"], 3);
+    assert!(regions["regions"][0]["last_denied"].is_number());
+    assert_eq!(regions["regions"][1]["region"], "KR920");
+    assert_eq!(regions["regions"][1]["hits"], 0);
+    assert!(
+        regions["regions"][1]["last_denied"].is_null(),
+        "an unused rule has no last-denied time"
+    );
+
+    let hotspots: serde_json::Value = serde_json::from_str(
+        &common::http(api, "GET", "/api/v1/deny-list/hotspots", None, None)
+            .await
+            .1,
+    )
+    .unwrap();
+    assert_eq!(hotspots["activity_since_start"]["denied"], 1);
+    assert_eq!(hotspots["hotspots"][0]["address"], HOTSPOT_A);
+    assert_eq!(hotspots["hotspots"][0]["hits"], 1);
+    // The animal name rides along, so the busiest hotspot is identifiable.
+    assert_eq!(hotspots["hotspots"][0]["name"], animal_name(HOTSPOT_A));
+}
+
+#[tokio::test]
+async fn metrics_break_denials_down_by_reason_and_region() {
+    let settings = common::test_settings_with_deny_lists(
+        vec![HOTSPOT_A.to_string()],
+        vec!["EU868".to_string()],
+    );
+    let grpc_addr = common::available_port().await;
+    let (_shutdown, api) = common::start_server_with_api(&settings, grpc_addr).await;
+    let mut client = common::connect_client(grpc_addr).await;
+
+    // Region-only, hotspot-only, and a request matching both.
+    common::inc(&mut client, "a", vec![], Region::Eu868 as i32).await;
+    common::inc(
+        &mut client,
+        "b",
+        HOTSPOT_A.as_bytes().to_vec(),
+        Region::Au915 as i32,
+    )
+    .await;
+    common::inc(
+        &mut client,
+        "c",
+        HOTSPOT_A.as_bytes().to_vec(),
+        Region::Eu868 as i32,
+    )
+    .await;
+
+    // The per-entry view attributes the "both" request to each list.
+    let (_, body) = common::http(api, "GET", "/api/v1/deny-list", None, None).await;
+    let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(view["activity_since_start"]["regions"]["denied"], 2);
+    assert_eq!(view["activity_since_start"]["hotspots"]["denied"], 2);
+}

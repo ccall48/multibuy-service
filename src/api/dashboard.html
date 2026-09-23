@@ -73,6 +73,13 @@
   ul.entries li .entry .animal { font-weight: 600; }
   ul.entries li .entry .addr { font-family: var(--mono); font-size: 11px; color: var(--muted);
                                word-break: break-all; margin-top: 1px; }
+  ul.entries li .hits { text-align: right; font-size: 12px; font-variant-numeric: tabular-nums;
+                        white-space: nowrap; }
+  ul.entries li .hits .n { font-weight: 600; }
+  ul.entries li .hits .when { display: block; color: var(--muted); font-size: 11px; }
+  ul.entries li.idle .entry .primary { color: var(--muted); }
+  ul.entries li.idle .hits .n { color: var(--muted); font-weight: 400; }
+  ul.entries li.active .hits .n { color: var(--warn); }
   ul.entries li button { padding: 3px 9px; font-size: 12px; }
   .empty { color: var(--muted); font-size: 13px; padding: 12px 0 2px; }
   .preview { font-size: 12px; color: var(--muted); margin-top: 8px; min-height: 18px; }
@@ -121,7 +128,8 @@
   <div class="note" id="persist-note"></div>
   <div class="panels">
     <section class="panel">
-      <div class="head"><strong>Denied regions</strong><span class="count" id="region-count"></span></div>
+      <div class="head"><strong>Denied regions</strong><span class="count" id="region-count"></span>
+        <span class="spacer" style="flex:1"></span><span class="count" id="region-activity"></span></div>
       <div class="body">
         <div class="row">
           <select id="region-select"><option value="">loading…</option></select>
@@ -132,7 +140,8 @@
     </section>
 
     <section class="panel">
-      <div class="head"><strong>Denied hotspots</strong><span class="count" id="hotspot-count"></span></div>
+      <div class="head"><strong>Denied hotspots</strong><span class="count" id="hotspot-count"></span>
+        <span class="spacer" style="flex:1"></span><span class="count" id="hotspot-activity"></span></div>
       <div class="body">
         <div class="row">
           <input class="mono" id="hotspot-input" placeholder="base58 hotspot address" spellcheck="false" autocomplete="off">
@@ -291,12 +300,22 @@ function renderCards(samples, elapsedSeconds) {
 
   const deniedPct = hits && denied !== null && hits > 0 ? (denied / hits) * 100 : null;
 
+  // Which rule is doing the denying, from the labelled counter.
+  const byReason = ["hotspot", "region", "both"]
+    .map((reason) => [reason, valueOf(samples, "multi_buy_denied_by_reason_total", { reason })])
+    .filter(([, v]) => v);
+  const reasonText = byReason.length
+    ? byReason.map(([reason, v]) => fmt(v) + " " + reason).join(" · ")
+    : "no denials yet";
+
   const cards = [
     { label: "Requests", value: fmt(hits),
       sub: hitRate === null ? "measuring…" : fmt(hitRate, 1) + " req/s", spark: hitSeries },
     { label: "Denied", value: fmt(denied),
       sub: deniedPct === null ? "–" : fmt(deniedPct, 2) + "% of requests" +
            (denyRate === null ? "" : " · " + fmt(denyRate, 1) + "/s"), spark: denySeries },
+    { label: "Denied by", value: byReason.length ? byReason[0][0] : "–",
+      sub: reasonText, spark: [] },
     { label: "Cache entries", value: fmt(cache), sub: "keys awaiting cleanup", spark: cacheSeries },
     { label: "Latency", value: p50 === null ? "–" : fmt(p50, 2) + " ms",
       sub: p99 === null ? "p50" : "p50 · p99 " + fmt(p99, 2) + " ms", spark: [] },
@@ -337,21 +356,44 @@ function renderList(kind, entries) {
   list.innerHTML = entries.map(() =>
     "<li><div class='entry'><div class='primary'></div>" +
     (isHotspot ? "<div class='addr'></div>" : "") +
-    "</div><button class='ghost'>Remove</button></li>").join("");
+    "</div><div class='hits'><span class='n'></span><span class='when'></span></div>" +
+    "<button class='ghost'>Remove</button></li>").join("");
   // Values go in via textContent, never interpolated into HTML.
   [...list.children].forEach((li, i) => {
     const entry = entries[i];
-    const value = isHotspot ? entry.address : entry;
+    const value = isHotspot ? entry.address : entry.region;
     const primary = li.querySelector(".primary");
     if (isHotspot) {
       primary.textContent = entry.name || "(unnamed)";
       primary.className = "primary animal";
       li.querySelector(".addr").textContent = entry.address;
     } else {
-      primary.textContent = entry;
+      primary.textContent = entry.region;
     }
+    // A rule that has never matched is dimmed: it is either stale or wrong.
+    li.className = entry.hits > 0 ? "active" : "idle";
+    li.querySelector(".n").textContent = entry.hits > 0
+      ? entry.hits.toLocaleString() + (entry.hits === 1 ? " denial" : " denials")
+      : "no denials yet";
+    li.querySelector(".when").textContent = entry.last_denied
+      ? "last " + agoText(entry.last_denied)
+      : "";
     li.querySelector("button").onclick = () => removeEntry(kind, value);
   });
+}
+
+// `last_denied` is unix seconds from the server.
+function agoText(unixSeconds) {
+  const seconds = Math.max(0, Math.round(Date.now() / 1000 - unixSeconds));
+  return seconds < 5 ? "just now" : humanize(seconds) + " ago";
+}
+
+function renderActivity(kind, stats) {
+  const el = $(kind + "-activity");
+  if (!stats) { el.textContent = ""; return; }
+  const parts = [stats.denied.toLocaleString() + " denied"];
+  if (stats.never_matched) parts.push(stats.never_matched + " unused");
+  el.textContent = parts.join(" · ");
 }
 
 // ------------------------------------------------------------ actions
@@ -437,6 +479,9 @@ async function loadDenyLists() {
   const denyList = await apiJson("/api/v1/deny-list");
   renderList("region", denyList.regions);
   renderList("hotspot", denyList.hotspots);
+  const activity = denyList.activity_since_start || {};
+  renderActivity("region", activity.regions);
+  renderActivity("hotspot", activity.hotspots);
 }
 
 async function loadRegionOptions() {

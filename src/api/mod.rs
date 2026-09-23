@@ -236,21 +236,67 @@ async fn known_regions() -> Json<KnownRegions> {
 }
 
 /// A denied hotspot, with the Angry Purple Tiger name operators recognise from
-/// Helium explorers and wallets alongside the raw address.
+/// Helium explorers and wallets alongside the raw address, plus how much traffic
+/// it is actually denying.
 #[derive(Serialize)]
 struct HotspotEntry {
     address: String,
     name: String,
+    /// Requests this entry has denied since the process started.
+    hits: u64,
+    /// Unix seconds of the most recent denial; null if it has never matched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_denied: Option<u64>,
 }
 
 impl HotspotEntry {
+    /// For an address with no stats to hand (e.g. echoing back what a caller
+    /// just sent), reported as never having matched.
     fn new(address: String) -> Self {
-        let name = deny_lists::animal_name(&address);
-        Self { address, name }
+        Self::from_entry(deny_lists::DenyEntry {
+            value: address,
+            hits: 0,
+            last_hit: None,
+        })
+    }
+
+    fn from_entry(entry: deny_lists::DenyEntry) -> Self {
+        Self {
+            name: deny_lists::animal_name(&entry.value),
+            address: entry.value,
+            hits: entry.hits,
+            last_denied: entry.last_hit,
+        }
     }
 
     fn list(addresses: Vec<String>) -> Vec<Self> {
         addresses.into_iter().map(Self::new).collect()
+    }
+
+    fn from_entries(entries: Vec<deny_lists::DenyEntry>) -> Vec<Self> {
+        entries.into_iter().map(Self::from_entry).collect()
+    }
+}
+
+/// A denied region with its denial counts.
+#[derive(Serialize)]
+struct RegionEntry {
+    region: String,
+    hits: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_denied: Option<u64>,
+}
+
+impl RegionEntry {
+    fn from_entries(entries: Vec<deny_lists::DenyEntry>) -> Vec<Self> {
+        entries
+            .into_iter()
+            .map(|e| Self {
+                region: e.value,
+                hits: e.hits,
+                last_denied: e.last_hit,
+            })
+            .collect()
     }
 }
 
@@ -271,44 +317,80 @@ async fn lookup_animal_name(Path(hotspot): Path<String>) -> Result<Json<AnimalNa
     }))
 }
 
+/// Denial activity for one list.
+#[derive(Serialize)]
+struct ListActivity {
+    /// Requests this list has denied since the process started.
+    denied: u64,
+    /// Entries that have never matched — stale rules, or addresses that were
+    /// mistyped before the API validated them.
+    never_matched: usize,
+}
+
 #[derive(Serialize)]
 struct DenyListView {
     hotspots: Vec<HotspotEntry>,
-    regions: Vec<String>,
+    regions: Vec<RegionEntry>,
+    /// Counts are since process start and are not persisted.
+    activity_since_start: Activity,
+}
+
+#[derive(Serialize)]
+struct Activity {
+    hotspots: ListActivity,
+    regions: ListActivity,
+}
+
+fn activity(entries: &[deny_lists::DenyEntry]) -> ListActivity {
+    ListActivity {
+        denied: entries.iter().map(|e| e.hits).sum(),
+        never_matched: entries.iter().filter(|e| e.hits == 0).count(),
+    }
 }
 
 async fn get_deny_list(State(state): State<ApiState>) -> Json<DenyListView> {
+    let hotspots = state.deny_lists.hotspot_entries();
+    let regions = state.deny_lists.region_entries();
+    let activity_since_start = Activity {
+        hotspots: activity(&hotspots),
+        regions: activity(&regions),
+    };
     Json(DenyListView {
-        hotspots: HotspotEntry::list(state.deny_lists.hotspots()),
-        regions: state.deny_lists.region_names(),
+        hotspots: HotspotEntry::from_entries(hotspots),
+        regions: RegionEntry::from_entries(regions),
+        activity_since_start,
     })
 }
 
 #[derive(Serialize)]
 struct HotspotsView {
     count: usize,
+    activity_since_start: ListActivity,
     hotspots: Vec<HotspotEntry>,
 }
 
 async fn get_hotspots(State(state): State<ApiState>) -> Json<HotspotsView> {
-    let hotspots = state.deny_lists.hotspots();
+    let entries = state.deny_lists.hotspot_entries();
     Json(HotspotsView {
-        count: hotspots.len(),
-        hotspots: HotspotEntry::list(hotspots),
+        count: entries.len(),
+        activity_since_start: activity(&entries),
+        hotspots: HotspotEntry::from_entries(entries),
     })
 }
 
 #[derive(Serialize)]
 struct RegionsView {
     count: usize,
-    regions: Vec<String>,
+    activity_since_start: ListActivity,
+    regions: Vec<RegionEntry>,
 }
 
 async fn get_regions(State(state): State<ApiState>) -> Json<RegionsView> {
-    let regions = state.deny_lists.region_names();
+    let entries = state.deny_lists.region_entries();
     Json(RegionsView {
-        count: regions.len(),
-        regions,
+        count: entries.len(),
+        activity_since_start: activity(&entries),
+        regions: RegionEntry::from_entries(entries),
     })
 }
 
@@ -369,7 +451,7 @@ struct HotspotMutation {
 struct RegionMutation {
     changed: Vec<String>,
     unchanged: Vec<String>,
-    regions: Vec<String>,
+    regions: Vec<RegionEntry>,
     persisted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     warning: Option<String>,
@@ -516,13 +598,13 @@ fn hotspot_mutation(
     changed: Vec<String>,
     unchanged: Vec<String>,
 ) -> HotspotMutation {
-    let hotspots = state.deny_lists.hotspots();
-    crate::metrics::set_deny_list_size("hotspots", hotspots.len());
+    let entries = state.deny_lists.hotspot_entries();
+    crate::metrics::set_deny_list_size("hotspots", entries.len());
     let (persisted, warning) = persist(state, &changed);
     HotspotMutation {
         changed: HotspotEntry::list(changed),
         unchanged: HotspotEntry::list(unchanged),
-        hotspots: HotspotEntry::list(hotspots),
+        hotspots: HotspotEntry::from_entries(entries),
         persisted,
         warning,
     }
@@ -533,13 +615,13 @@ fn region_mutation(
     changed: Vec<String>,
     unchanged: Vec<String>,
 ) -> RegionMutation {
-    let regions = state.deny_lists.region_names();
-    crate::metrics::set_deny_list_size("regions", regions.len());
+    let entries = state.deny_lists.region_entries();
+    crate::metrics::set_deny_list_size("regions", entries.len());
     let (persisted, warning) = persist(state, &changed);
     RegionMutation {
         changed,
         unchanged,
-        regions,
+        regions: RegionEntry::from_entries(entries),
         persisted,
         warning,
     }

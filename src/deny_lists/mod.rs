@@ -1,16 +1,91 @@
 pub mod store;
 
 use angry_purple_tiger::AnimalName;
-use dashmap::DashSet;
+use dashmap::DashMap;
 use helium_proto::services::multi_buy::MultiBuyIncReqV1;
 use helium_proto::Region;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 pub use store::{Delta, DenyListDeltas, DenyListStore};
 
 /// Highest proto enum value scanned when enumerating known regions.
 /// `helium.region` is sparse (0..=27 plus `UNKNOWN = 99`), so invalid
 /// values in between are simply skipped.
 const MAX_REGION_VALUE: i32 = 99;
+
+/// How many requests an entry has denied, and when it last did.
+///
+/// Counting per entry is what makes a deny list reviewable in use: it separates
+/// the rules doing work from the ones that never match — a stale address, or one
+/// that was mistyped before validation existed.
+#[derive(Debug, Default)]
+pub struct DenyStats {
+    hits: AtomicU64,
+    /// Unix seconds of the most recent denial; 0 means "never matched".
+    last_hit: AtomicU64,
+}
+
+impl DenyStats {
+    /// Record a denial. Called on the request path, so it is two relaxed atomic
+    /// writes and no allocation — the surrounding `DashMap` read only takes a
+    /// shard read lock, which writers never block behind.
+    fn record_hit(&self) {
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        self.last_hit.store(now_unix(), Ordering::Relaxed);
+    }
+
+    pub fn hits(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
+    }
+
+    /// Unix seconds of the last denial, or `None` if this entry never matched.
+    pub fn last_hit(&self) -> Option<u64> {
+        match self.last_hit.load(Ordering::Relaxed) {
+            0 => None,
+            secs => Some(secs),
+        }
+    }
+}
+
+/// A point-in-time view of one deny-list entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DenyEntry {
+    /// The hotspot address or region name.
+    pub value: String,
+    pub hits: u64,
+    pub last_hit: Option<u64>,
+}
+
+/// Which rule (or rules) caused a request to be denied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DenyMatch {
+    pub hotspot: bool,
+    pub region: bool,
+}
+
+impl DenyMatch {
+    pub fn is_denied(&self) -> bool {
+        self.hotspot || self.region
+    }
+
+    /// A short label for logs and metrics. Bounded to three values, so it is
+    /// safe to use as a Prometheus label.
+    pub fn reason(&self) -> &'static str {
+        match (self.hotspot, self.region) {
+            (true, true) => "both",
+            (true, false) => "hotspot",
+            (false, true) => "region",
+            (false, false) => "none",
+        }
+    }
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
 
 /// Deny lists ready for O(1) lookups.
 ///
@@ -19,10 +94,10 @@ const MAX_REGION_VALUE: i32 = 99;
 /// through the admin API takes effect on the next `inc` request.
 #[derive(Default)]
 pub struct DenyLists {
-    /// Base58check hotspot addresses to deny.
-    hotspots: DashSet<String>,
-    /// Proto region enum values to deny.
-    regions: DashSet<i32>,
+    /// Base58check hotspot addresses to deny, with per-entry denial counts.
+    hotspots: DashMap<String, DenyStats>,
+    /// Proto region enum values to deny, with per-entry denial counts.
+    regions: DashMap<i32, DenyStats>,
     /// The configured lists, kept so runtime changes can be persisted as a
     /// delta against them. See [`store`].
     config_hotspots: HashSet<String>,
@@ -67,28 +142,28 @@ impl DenyLists {
 
         let mut suppressed = Vec::new();
 
-        let hotspots = DashSet::new();
+        let hotspots = DashMap::new();
         for key in &config_hotspots {
             if deltas.hotspots.removed.contains(key) {
                 suppressed.push(format!("hotspot {key}"));
             } else {
-                hotspots.insert(key.clone());
+                hotspots.insert(key.clone(), DenyStats::default());
             }
         }
         for key in &deltas.hotspots.added {
-            hotspots.insert(key.clone());
+            hotspots.insert(key.clone(), DenyStats::default());
         }
 
-        let regions = DashSet::new();
+        let regions = DashMap::new();
         for name in &config_regions {
             if deltas.regions.removed.contains(name) {
                 suppressed.push(format!("region {name}"));
             } else {
-                regions.insert(parse_region(name)? as i32);
+                regions.insert(parse_region(name)? as i32, DenyStats::default());
             }
         }
         for name in &deltas.regions.added {
-            regions.insert(parse_region(name)? as i32);
+            regions.insert(parse_region(name)? as i32, DenyStats::default());
         }
 
         suppressed.sort();
@@ -117,7 +192,8 @@ impl DenyLists {
     /// How the live lists currently differ from the configured ones — what gets
     /// written to the store.
     pub fn deltas(&self) -> DenyListDeltas {
-        let live_hotspots: HashSet<String> = self.hotspots.iter().map(|k| k.clone()).collect();
+        let live_hotspots: HashSet<String> =
+            self.hotspots.iter().map(|e| e.key().clone()).collect();
         let live_regions: HashSet<String> = self.region_names().into_iter().collect();
 
         DenyListDeltas {
@@ -127,24 +203,80 @@ impl DenyLists {
         }
     }
 
-    /// Returns `true` if the request should be denied based on hotspot key or region.
-    pub fn is_denied(&self, req: &MultiBuyIncReqV1) -> bool {
+    /// Check a request against both lists, recording a hit on every entry that
+    /// matched.
+    ///
+    /// Both lists are checked even once one has matched, so a request denied by
+    /// hotspot *and* region is counted against both entries — otherwise a
+    /// region's counter would silently under-report whenever a denied hotspot in
+    /// it was also listed.
+    pub fn check(&self, req: &MultiBuyIncReqV1) -> DenyMatch {
+        let mut matched = DenyMatch::default();
+
         if let Ok(hotspot_str) = std::str::from_utf8(&req.hotspot_key) {
-            if self.hotspots.contains(hotspot_str) {
-                return true;
+            if let Some(stats) = self.hotspots.get(hotspot_str) {
+                stats.record_hit();
+                matched.hotspot = true;
             }
         }
-        if self.regions.contains(&req.region) {
-            return true;
+        if let Some(stats) = self.regions.get(&req.region) {
+            stats.record_hit();
+            matched.region = true;
         }
-        false
+
+        matched
+    }
+
+    /// Whether the request should be denied. Records hits, like [`Self::check`].
+    pub fn is_denied(&self, req: &MultiBuyIncReqV1) -> bool {
+        self.check(req).is_denied()
     }
 
     /// Currently denied hotspot addresses, sorted.
     pub fn hotspots(&self) -> Vec<String> {
-        let mut out: Vec<String> = self.hotspots.iter().map(|k| k.clone()).collect();
+        let mut out: Vec<String> = self.hotspots.iter().map(|e| e.key().clone()).collect();
         out.sort();
         out
+    }
+
+    /// Denied hotspots with their denial counts, busiest first.
+    pub fn hotspot_entries(&self) -> Vec<DenyEntry> {
+        let mut out: Vec<DenyEntry> = self
+            .hotspots
+            .iter()
+            .map(|e| DenyEntry {
+                value: e.key().clone(),
+                hits: e.value().hits(),
+                last_hit: e.value().last_hit(),
+            })
+            .collect();
+        sort_entries(&mut out);
+        out
+    }
+
+    /// Denied regions with their denial counts, busiest first.
+    pub fn region_entries(&self) -> Vec<DenyEntry> {
+        let mut out: Vec<DenyEntry> = self
+            .regions
+            .iter()
+            .map(|e| DenyEntry {
+                value: region_label(*e.key()),
+                hits: e.value().hits(),
+                last_hit: e.value().last_hit(),
+            })
+            .collect();
+        sort_entries(&mut out);
+        out
+    }
+
+    /// Total denials recorded per list since startup.
+    ///
+    /// Counts live in memory only: they describe this process's traffic, not the
+    /// deny list itself, so they reset on restart and are never persisted.
+    pub fn hit_totals(&self) -> (u64, u64) {
+        let hotspots = self.hotspots.iter().map(|e| e.value().hits()).sum();
+        let regions = self.regions.iter().map(|e| e.value().hits()).sum();
+        (hotspots, regions)
     }
 
     /// Currently denied region names, sorted.
@@ -155,17 +287,23 @@ impl DenyLists {
         let mut out: Vec<String> = self
             .regions
             .iter()
-            .map(|v| {
-                Region::try_from(*v).map_or_else(|_| v.to_string(), |r| r.as_str_name().to_string())
-            })
+            .map(|e| region_label(*e.key()))
             .collect();
         out.sort();
         out
     }
 
     /// Add a hotspot address. Returns `true` if it was not already denied.
+    ///
+    /// Re-adding an entry that is already present leaves its counters alone.
     pub fn add_hotspot(&self, key_b58: &str) -> bool {
-        self.hotspots.insert(key_b58.to_string())
+        match self.hotspots.entry(key_b58.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => false,
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                slot.insert(DenyStats::default());
+                true
+            }
+        }
     }
 
     /// Remove a hotspot address. Returns `true` if it had been denied.
@@ -175,13 +313,30 @@ impl DenyLists {
 
     /// Add a region by proto enum name. Returns `true` if it was not already denied.
     pub fn add_region(&self, name: &str) -> anyhow::Result<bool> {
-        Ok(self.regions.insert(parse_region(name)? as i32))
+        match self.regions.entry(parse_region(name)? as i32) {
+            dashmap::mapref::entry::Entry::Occupied(_) => Ok(false),
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                slot.insert(DenyStats::default());
+                Ok(true)
+            }
+        }
     }
 
     /// Remove a region by proto enum name. Returns `true` if it had been denied.
     pub fn remove_region(&self, name: &str) -> anyhow::Result<bool> {
         Ok(self.regions.remove(&(parse_region(name)? as i32)).is_some())
     }
+}
+
+/// Busiest entries first, then alphabetically so the order is stable.
+fn sort_entries(entries: &mut [DenyEntry]) {
+    entries.sort_by(|a, b| b.hits.cmp(&a.hits).then_with(|| a.value.cmp(&b.value)));
+}
+
+/// A region's proto name, falling back to the raw integer for a value the proto
+/// no longer knows (only reachable if the enum shrinks under us).
+pub fn region_label(value: i32) -> String {
+    Region::try_from(value).map_or_else(|_| value.to_string(), |r| r.as_str_name().to_string())
 }
 
 /// Resolve a proto region enum name, e.g. "US915".
@@ -284,6 +439,111 @@ mod tests {
         assert!(deny.remove_hotspot(hotspot));
         assert!(!deny.is_denied(&req(hotspot.as_bytes(), 0)));
         assert!(!deny.remove_hotspot(hotspot));
+    }
+
+    #[test]
+    fn hits_are_counted_per_entry() {
+        let hotspot = "13QZwkEXgjE3WzWzy6DvJ1dqKsZM5s3fc4pkFpFb2yME2nRRnJv";
+        let deny = DenyLists::default();
+        deny.add_region("EU868").unwrap();
+        deny.add_hotspot(hotspot);
+
+        // A region denial counts against that region only.
+        deny.check(&req(b"", Region::Eu868 as i32));
+        deny.check(&req(b"", Region::Eu868 as i32));
+        // A hotspot denial in an allowed region counts against the hotspot only.
+        deny.check(&req(hotspot.as_bytes(), Region::Kr920 as i32));
+        // A request matching neither moves nothing.
+        deny.check(&req(b"other", Region::Kr920 as i32));
+
+        let regions = deny.region_entries();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].value, "EU868");
+        assert_eq!(regions[0].hits, 2);
+
+        let hotspots = deny.hotspot_entries();
+        assert_eq!(hotspots[0].hits, 1);
+        assert_eq!(deny.hit_totals(), (1, 2));
+    }
+
+    #[test]
+    fn a_request_matching_both_lists_counts_against_both() {
+        let hotspot = "13QZwkEXgjE3WzWzy6DvJ1dqKsZM5s3fc4pkFpFb2yME2nRRnJv";
+        let deny = DenyLists::default();
+        deny.add_region("EU868").unwrap();
+        deny.add_hotspot(hotspot);
+
+        let matched = deny.check(&req(hotspot.as_bytes(), Region::Eu868 as i32));
+        assert!(matched.hotspot && matched.region);
+        assert_eq!(matched.reason(), "both");
+        assert_eq!(deny.hit_totals(), (1, 1));
+    }
+
+    #[test]
+    fn reason_reflects_which_rule_matched() {
+        let hotspot = "13QZwkEXgjE3WzWzy6DvJ1dqKsZM5s3fc4pkFpFb2yME2nRRnJv";
+        let deny = DenyLists::default();
+        deny.add_region("EU868").unwrap();
+        deny.add_hotspot(hotspot);
+
+        assert_eq!(
+            deny.check(&req(b"", Region::Eu868 as i32)).reason(),
+            "region"
+        );
+        assert_eq!(
+            deny.check(&req(hotspot.as_bytes(), Region::Kr920 as i32))
+                .reason(),
+            "hotspot"
+        );
+        let allowed = deny.check(&req(b"", Region::Kr920 as i32));
+        assert_eq!(allowed.reason(), "none");
+        assert!(!allowed.is_denied());
+    }
+
+    #[test]
+    fn never_matched_entries_report_no_last_hit() {
+        let deny = DenyLists::default();
+        deny.add_region("EU868").unwrap();
+
+        let before = &deny.region_entries()[0];
+        assert_eq!(before.hits, 0);
+        assert_eq!(before.last_hit, None, "an unused rule has never matched");
+
+        deny.check(&req(b"", Region::Eu868 as i32));
+        let after = &deny.region_entries()[0];
+        assert_eq!(after.hits, 1);
+        assert!(after.last_hit.is_some(), "a matched rule records when");
+    }
+
+    #[test]
+    fn entries_are_listed_busiest_first() {
+        let deny = DenyLists::default();
+        deny.add_region("EU868").unwrap();
+        deny.add_region("KR920").unwrap();
+        deny.add_region("IN865").unwrap();
+
+        deny.check(&req(b"", Region::Kr920 as i32));
+        deny.check(&req(b"", Region::Kr920 as i32));
+        deny.check(&req(b"", Region::In865 as i32));
+
+        let names: Vec<String> = deny.region_entries().into_iter().map(|e| e.value).collect();
+        // KR920 (2 hits), IN865 (1), then the untouched EU868.
+        assert_eq!(names, vec!["KR920", "IN865", "EU868"]);
+    }
+
+    #[test]
+    fn readding_an_existing_entry_keeps_its_counts() {
+        let deny = DenyLists::default();
+        deny.add_region("EU868").unwrap();
+        deny.check(&req(b"", Region::Eu868 as i32));
+
+        assert!(!deny.add_region("EU868").unwrap(), "already denied");
+        assert_eq!(deny.region_entries()[0].hits, 1, "counts should survive");
+
+        // Removing and re-adding is a new rule, so counts start over.
+        assert!(deny.remove_region("EU868").unwrap());
+        assert!(deny.add_region("EU868").unwrap());
+        assert_eq!(deny.region_entries()[0].hits, 0);
     }
 
     #[test]

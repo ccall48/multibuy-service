@@ -91,25 +91,36 @@ impl multi_buy_server::MultiBuy for State {
         crate::metrics::increment_hit();
 
         let multi_buy_req = request.into_inner();
-        let denied = self.deny_lists.is_denied(&multi_buy_req);
+        // Records a hit against each entry that matched, so the admin API can
+        // report which rules are actually doing work.
+        let matched = self.deny_lists.check(&multi_buy_req);
+        let denied = matched.is_denied();
         let count = self.cache.inc(multi_buy_req.key.clone());
         let hotspot = String::from_utf8_lossy(&multi_buy_req.hotspot_key).into_owned();
+        // The proto region is an integer; log the name so a denial is readable
+        // without a lookup table.
+        let region = crate::deny_lists::region_label(multi_buy_req.region);
 
         if denied {
             tracing::info!(
                 key = %multi_buy_req.key,
                 count,
                 hotspot,
-                region = %multi_buy_req.region,
+                region = %region,
+                reason = matched.reason(),
                 "denied by deny list"
             );
             crate::metrics::increment_denied();
+            crate::metrics::increment_denied_by_reason(matched.reason());
+            if matched.region {
+                crate::metrics::increment_denied_by_region(region);
+            }
         } else {
             tracing::debug!(
                 key = %multi_buy_req.key,
                 count,
                 hotspot,
-                region = %multi_buy_req.region,
+                region = %region,
                 "got inc req"
             );
         }

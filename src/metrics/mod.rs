@@ -9,6 +9,8 @@ const DENIED_TOTAL: &str = "multi_buy_denied_total";
 const CACHE_SIZE: &str = "multi_buy_cache_size";
 const REQUEST_DURATION: &str = "multi_buy_request_duration_ms";
 const DENY_LIST_SIZE: &str = "multi_buy_deny_list_size";
+const DENIED_BY_REASON: &str = "multi_buy_denied_by_reason_total";
+const DENIED_BY_REGION: &str = "multi_buy_denied_by_region_total";
 
 /// Install the recorder, start the Prometheus scrape endpoint, and return a
 /// handle that can render the same payload in-process (used by the dashboard).
@@ -46,6 +48,22 @@ pub fn increment_hit() {
 
 pub fn increment_denied() {
     metrics::counter!(DENIED_TOTAL).increment(1);
+}
+
+/// Break denials down by which rule matched: "hotspot", "region" or "both".
+/// Three series at most, so this is safe to label.
+pub fn increment_denied_by_reason(reason: &'static str) {
+    metrics::counter!(DENIED_BY_REASON, "reason" => reason).increment(1);
+}
+
+/// Denials attributed to a specific region.
+///
+/// Bounded by the proto enum (~28 values), so the cardinality is safe. There is
+/// deliberately no per-hotspot equivalent: that would create one series per
+/// denied address, which is unbounded from Prometheus's point of view. Per-hotspot
+/// counts are exposed through the admin API instead.
+pub fn increment_denied_by_region(region: String) {
+    metrics::counter!(DENIED_BY_REGION, "region" => region).increment(1);
 }
 
 pub fn set_cache_size(size: f64) {

@@ -12,6 +12,7 @@ As packets come in to HPR A and HPR B, they will check in with Multi-Buy service
 
 - Distributed packet counter across load-balanced HPR instances
 - Hotspot and region deny lists, editable at runtime over HTTP and persisted across restarts
+- Per-entry denial counts, so you can see which rules are actually firing
 - Admin API + metrics dashboard, with Angry Purple Tiger animal names for hotspots
 - Prometheus metrics endpoint
 - Automatic cache cleanup (configurable, default 30 minutes)
@@ -142,8 +143,70 @@ listen = "0.0.0.0:6081"
 | `multi_buy_cache_size` | Gauge | Number of entries in the cache |
 | `multi_buy_cache_cleaned_total` | Counter | Total entries removed by cache cleanup |
 | `multi_buy_deny_list_size` | Gauge | Deny list entries, labelled `kind="hotspots"\|"regions"` |
+| `multi_buy_denied_by_reason_total` | Counter | Denials by matching rule, labelled `reason="hotspot"\|"region"\|"both"` |
+| `multi_buy_denied_by_region_total` | Counter | Denials attributed to a region, labelled `region="EU868"` etc. |
 
 Metrics are exposed at `http://{endpoint}/metrics` in Prometheus format.
+
+`multi_buy_denied_total` is unchanged and still counts every denial once. The two
+labelled counters break it down; `reason="both"` means a request matched a denied
+hotspot *and* a denied region, so
+`sum(multi_buy_denied_by_reason_total) == multi_buy_denied_total`.
+
+There is deliberately **no per-hotspot Prometheus counter**: that would create one
+series per denied address, which is unbounded from Prometheus's point of view.
+Per-hotspot counts come from the admin API instead, where cardinality costs
+nothing. Region labels are bounded by the proto enum (~28 values), so those are
+safe.
+
+## Seeing which rules are firing
+
+Every deny-list entry carries its own denial count and the time it last matched,
+so a list can be audited in use rather than guessed at:
+
+```bash
+curl -s $API/api/v1/deny-list | jq
+```
+
+```json
+{
+  "hotspots": [
+    {
+      "address": "13QZwkEXgjE3WzWzy6DvJ1dqKsZM5s3fc4pkFpFb2yME2nRRnJv",
+      "name": "mean-gingerbread-seal",
+      "hits": 3,
+      "last_denied": 1790132996
+    }
+  ],
+  "regions": [
+    { "region": "EU868", "hits": 6, "last_denied": 1790132996 },
+    { "region": "KR920", "hits": 0 }
+  ],
+  "activity_since_start": {
+    "hotspots": { "denied": 3, "never_matched": 0 },
+    "regions": { "denied": 6, "never_matched": 1 }
+  }
+}
+```
+
+Entries are returned busiest first. An entry with `hits: 0` and no `last_denied`
+has **never matched** — a rule that is stale, or one that was never going to work
+(a mistyped address, say). `never_matched` counts them per list, and the dashboard
+dims those rows.
+
+A request matching a denied hotspot *and* a denied region is counted against both
+entries, so neither list under-reports. That is why the two `denied` totals above
+can sum to more than `multi_buy_denied_total`.
+
+Counts are per process: they describe traffic, not configuration, so they reset on
+restart and are never written to the store. Removing and re-adding an entry
+restarts its count; re-adding one that is already denied leaves it alone.
+
+Each denial is also logged at INFO with the matching rule and the region *name*:
+
+```
+denied by deny list key=both-1 count=1 hotspot="13QZwk…" region=EU868 reason="both"
+```
 
 ## Dashboard
 
