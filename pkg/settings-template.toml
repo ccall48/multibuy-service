@@ -14,6 +14,13 @@ grpc_listen = "0.0.0.0:6080"
 # Env: MB__DENIED_REGIONS
 # denied_regions = []
 
+# Where deny-list changes made through the admin API are persisted, so they
+# survive a restart. The file records only how the live lists differ from
+# denied_hotspots / denied_regions above, which stay the baseline.
+# Set to "" to keep API changes in memory only.
+# Env: MB__DENY_LIST_STORE
+# deny_list_store = "deny-list.json"
+
 # Prometheus metrics endpoint
 [metrics]
 # Env: MB__METRICS__ENDPOINT

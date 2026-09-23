@@ -68,9 +68,18 @@
   ul.entries { list-style: none; margin: 12px 0 0; padding: 0; max-height: 300px; overflow: auto; }
   ul.entries li { display: flex; align-items: center; gap: 10px;
                   padding: 7px 0; border-top: 1px solid var(--border); }
-  ul.entries li span { font-family: var(--mono); font-size: 12px; word-break: break-all; flex: 1; }
+  ul.entries li .entry { flex: 1; min-width: 0; }
+  ul.entries li .entry .primary { font-size: 13px; word-break: break-all; }
+  ul.entries li .entry .animal { font-weight: 600; }
+  ul.entries li .entry .addr { font-family: var(--mono); font-size: 11px; color: var(--muted);
+                               word-break: break-all; margin-top: 1px; }
   ul.entries li button { padding: 3px 9px; font-size: 12px; }
   .empty { color: var(--muted); font-size: 13px; padding: 12px 0 2px; }
+  .preview { font-size: 12px; color: var(--muted); margin-top: 8px; min-height: 18px; }
+  .preview b { color: var(--text); font-weight: 600; }
+  .preview.bad { color: var(--bad); }
+  .note { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .note.warn { color: var(--warn); }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th, td { text-align: left; padding: 7px 10px; border-top: 1px solid var(--border); }
   th { color: var(--muted); font-weight: 500; font-size: 12px; }
@@ -109,6 +118,7 @@
   <div class="cards" id="cards"></div>
 
   <h2>Deny lists <span style="text-transform:none;letter-spacing:0;font-weight:400">— changes apply to the next request, no restart</span></h2>
+  <div class="note" id="persist-note"></div>
   <div class="panels">
     <section class="panel">
       <div class="head"><strong>Denied regions</strong><span class="count" id="region-count"></span></div>
@@ -128,6 +138,7 @@
           <input class="mono" id="hotspot-input" placeholder="base58 hotspot address" spellcheck="false" autocomplete="off">
           <button id="hotspot-add">Deny</button>
         </div>
+        <div class="preview" id="hotspot-preview"></div>
         <ul class="entries" id="hotspot-list"></ul>
       </div>
     </section>
@@ -313,6 +324,8 @@ function renderTable(samples) {
     : '<tr><td class="empty">No metrics reported yet.</td></tr>';
 }
 
+// Regions arrive as plain strings; hotspots as {address, name} so the Angry
+// Purple Tiger name can lead and the raw address sit underneath.
 function renderList(kind, entries) {
   const list = $(kind + "-list");
   $(kind + "-count").textContent = entries.length + (entries.length === 1 ? " entry" : " entries");
@@ -320,13 +333,24 @@ function renderList(kind, entries) {
     list.innerHTML = '<li style="border:0"><span class="empty">Nothing denied.</span></li>';
     return;
   }
-  list.innerHTML = entries.map((entry) =>
-    "<li><span></span><button class='ghost'>Remove</button></li>").join("");
-  // Set text via textContent and wire handlers so entry values are never
-  // interpolated into HTML.
+  const isHotspot = kind === "hotspot";
+  list.innerHTML = entries.map(() =>
+    "<li><div class='entry'><div class='primary'></div>" +
+    (isHotspot ? "<div class='addr'></div>" : "") +
+    "</div><button class='ghost'>Remove</button></li>").join("");
+  // Values go in via textContent, never interpolated into HTML.
   [...list.children].forEach((li, i) => {
-    li.querySelector("span").textContent = entries[i];
-    li.querySelector("button").onclick = () => removeEntry(kind, entries[i]);
+    const entry = entries[i];
+    const value = isHotspot ? entry.address : entry;
+    const primary = li.querySelector(".primary");
+    if (isHotspot) {
+      primary.textContent = entry.name || "(unnamed)";
+      primary.className = "primary animal";
+      li.querySelector(".addr").textContent = entry.address;
+    } else {
+      primary.textContent = entry;
+    }
+    li.querySelector("button").onclick = () => removeEntry(kind, value);
   });
 }
 
@@ -336,12 +360,23 @@ async function removeEntry(kind, value) {
   const path = "/api/v1/deny-list/" + (kind === "region" ? "regions" : "hotspots") +
     "/" + encodeURIComponent(value);
   try {
-    await api(path, { method: "DELETE" });
-    toast("Removed " + value + " from the deny list.", "ok");
+    const result = JSON.parse(await api(path, { method: "DELETE" }));
+    reportMutation(result, "Removed");
     await loadDenyLists();
   } catch (e) {
     toast(e.message, "err");
   }
+}
+
+// A mutation's `changed` list holds strings for regions, {address, name} for
+// hotspots — label the latter by animal name, which is what an operator reads.
+const labelChanged = (result) =>
+  (result.changed || []).map((c) => (typeof c === "string" ? c : c.name + " (" + c.address + ")"))
+    .join(", ");
+
+function reportMutation(result, fallback) {
+  toast(result.changed.length ? fallback + " " + labelChanged(result) + "." : fallback, "ok");
+  if (result.warning) toast(result.warning, "err");
 }
 
 async function addEntry(kind) {
@@ -353,14 +388,49 @@ async function addEntry(kind) {
   try {
     const result = await apiJson("/api/v1/deny-list/" + (isRegion ? "regions" : "hotspots"),
       { method: "POST", body: JSON.stringify(body) });
-    toast(result.changed.length
-      ? "Denied " + result.changed.join(", ") + "."
-      : value + " was already denied.", "ok");
-    if (!isRegion) field.value = "";
+    if (result.changed.length) {
+      reportMutation(result, "Denied");
+    } else {
+      toast(value + " was already denied.", "ok");
+    }
+    if (!isRegion) {
+      field.value = "";
+      $("hotspot-preview").textContent = "";
+    }
     await loadDenyLists();
   } catch (e) {
     toast(e.message, "err");
   }
+}
+
+// Resolve the animal name as the operator types, so they can confirm they have
+// the right hotspot before denying it. Debounced; the name comes from the server
+// because it is an md5-derived digest, not a local transform.
+let previewTimer = null;
+function schedulePreview() {
+  const field = $("hotspot-input");
+  const preview = $("hotspot-preview");
+  const value = field.value.trim();
+  clearTimeout(previewTimer);
+  if (!value) {
+    preview.textContent = "";
+    preview.className = "preview";
+    return;
+  }
+  previewTimer = setTimeout(async () => {
+    try {
+      const result = await apiJson("/api/v1/animal-name/" + encodeURIComponent(value));
+      preview.className = "preview";
+      preview.innerHTML = "";
+      preview.appendChild(document.createTextNode("This address is "));
+      const strong = document.createElement("b");
+      strong.textContent = result.name;
+      preview.appendChild(strong);
+    } catch (e) {
+      preview.className = "preview bad";
+      preview.textContent = e.message;
+    }
+  }, 350);
 }
 
 async function loadDenyLists() {
@@ -396,6 +466,16 @@ async function refresh() {
       ? (token ? "Change token" : "Set token")
       : "Token (not required)";
 
+    const note = $("persist-note");
+    if (info.persistent) {
+      note.className = "note";
+      note.textContent = "Changes persist to " + info.deny_list_store + " and survive a restart.";
+    } else {
+      note.className = "note warn";
+      note.textContent = "Persistence is off (deny_list_store is unset) — " +
+        "changes are live but will be lost on restart.";
+    }
+
     await loadDenyLists();
 
     $("dot").className = "dot live";
@@ -418,6 +498,7 @@ $("btn-token").onclick = () => promptToken();
 $("region-add").onclick = () => addEntry("region");
 $("hotspot-add").onclick = () => addEntry("hotspot");
 $("hotspot-input").addEventListener("keydown", (e) => { if (e.key === "Enter") addEntry("hotspot"); });
+$("hotspot-input").addEventListener("input", schedulePreview);
 
 loadRegionOptions().catch(() => {});
 refresh();

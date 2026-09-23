@@ -16,8 +16,20 @@ pub async fn available_port() -> SocketAddr {
 }
 
 /// Build a test Settings with defaults.
+///
+/// Persistence is off unless a test asks for it, so tests don't write a
+/// deny-list file into the working directory.
 pub fn test_settings() -> Settings {
     test_settings_with_cleanup(Duration::from_secs(60 * 30))
+}
+
+/// A unique temp path for a test's deny-list store.
+pub fn temp_store_path(label: &str) -> std::path::PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("mb-test-{label}-{}-{unique}", std::process::id()))
 }
 
 /// Build a test Settings with deny lists configured.
@@ -38,6 +50,7 @@ pub fn test_settings_with_cleanup(cleanup_timeout: Duration) -> Settings {
         |mut s| {
             s.grpc_listen = "127.0.0.1:0".parse().unwrap();
             s.cleanup_timeout = cleanup_timeout;
+            s.deny_list_store = std::path::PathBuf::new();
             s
         },
     )
@@ -108,6 +121,7 @@ pub async fn start_server_with_api(
     let state = State::new(settings).unwrap();
     let api_state = multi_buy_service::api::ApiState::new(
         state.deny_lists(),
+        state.deny_list_store(),
         metrics_exporter_prometheus::PrometheusBuilder::new()
             .build_recorder()
             .handle(),

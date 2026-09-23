@@ -2,7 +2,15 @@ use crate::common;
 use helium_proto::Region;
 
 const HOTSPOT_A: &str = "13QZwkEXgjE3WzWzy6DvJ1dqKsZM5s3fc4pkFpFb2yME2nRRnJv";
-const HOTSPOT_B: &str = "11z69eJ3czc92k6snrfR1ENqbHP9bovzR4RNiB9qTDs4JDYiY3R";
+/// A second address, valid base58check so the validating endpoints accept it.
+/// (`grpc_tests` uses an invented address for its "some other hotspot" case,
+/// which is fine there — that path matches raw bytes and never validates.)
+const HOTSPOT_B: &str = "112bUuQaE7j73THS9ABShHGokm46Miip9L361FSyWv7zSYn8hZWf";
+
+/// Computed once here so the test fails loudly if name derivation ever changes.
+fn animal_name(address: &str) -> String {
+    multi_buy_service::deny_lists::animal_name(address)
+}
 
 #[tokio::test]
 async fn deny_list_endpoints_show_configured_entries() {
@@ -17,6 +25,8 @@ async fn deny_list_endpoints_show_configured_entries() {
     assert_eq!(status, 200);
     assert!(body.contains(HOTSPOT_A), "body was {body}");
     assert!(body.contains("EU868"), "body was {body}");
+    // Denied hotspots carry their Angry Purple Tiger name alongside the address.
+    assert!(body.contains(&animal_name(HOTSPOT_A)), "body was {body}");
 
     let (status, body) = common::http(api, "GET", "/api/v1/deny-list/hotspots", None, None).await;
     assert_eq!(status, 200);
@@ -250,4 +260,190 @@ async fn dashboard_and_metrics_are_served() {
         body.contains("US915") && body.contains("AS923_1B"),
         "body was {body}"
     );
+}
+
+#[tokio::test]
+async fn hotspot_responses_carry_animal_names() {
+    let settings = common::test_settings();
+    let grpc_addr = common::available_port().await;
+    let (_shutdown, api) = common::start_server_with_api(&settings, grpc_addr).await;
+
+    let name = animal_name(HOTSPOT_A);
+    assert_eq!(name.split('-').count(), 3, "name was {name}");
+
+    // The name comes back on the mutation that adds it...
+    let (status, body) = common::http(
+        api,
+        "POST",
+        "/api/v1/deny-list/hotspots",
+        None,
+        Some(&format!(r#"{{"hotspot":"{HOTSPOT_A}"}}"#)),
+    )
+    .await;
+    assert_eq!(status, 200, "body was {body}");
+    assert!(body.contains(&name), "body was {body}");
+
+    // ...and on the listing.
+    let (_, body) = common::http(api, "GET", "/api/v1/deny-list/hotspots", None, None).await;
+    assert!(body.contains(&name), "body was {body}");
+    assert!(body.contains(HOTSPOT_A), "body was {body}");
+
+    // The lookup endpoint resolves a name without changing anything.
+    let (status, body) = common::http(
+        api,
+        "GET",
+        &format!("/api/v1/animal-name/{HOTSPOT_B}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(body.contains(&animal_name(HOTSPOT_B)), "body was {body}");
+
+    let (_, body) = common::http(api, "GET", "/api/v1/deny-list/hotspots", None, None).await;
+    assert!(
+        !body.contains(HOTSPOT_B),
+        "a name lookup must not deny anything: {body}"
+    );
+
+    // And rejects input that isn't a hotspot address.
+    let (status, _) = common::http(api, "GET", "/api/v1/animal-name/nope", None, None).await;
+    assert_eq!(status, 400);
+}
+
+#[tokio::test]
+async fn changes_survive_a_restart() {
+    let store = common::temp_store_path("restart");
+    let mut settings = common::test_settings_with_deny_lists(vec![], vec!["AU915".to_string()]);
+    settings.deny_list_store = store.clone();
+
+    // First run: deny a region and a hotspot, and un-deny a configured region.
+    {
+        let grpc_addr = common::available_port().await;
+        let (shutdown, api) = common::start_server_with_api(&settings, grpc_addr).await;
+
+        let (status, body) = common::http(
+            api,
+            "POST",
+            "/api/v1/deny-list/regions",
+            None,
+            Some(r#"{"region":"EU868"}"#),
+        )
+        .await;
+        assert_eq!(status, 200, "body was {body}");
+        assert!(body.contains("\"persisted\":true"), "body was {body}");
+
+        let (_, body) = common::http(
+            api,
+            "POST",
+            "/api/v1/deny-list/hotspots",
+            None,
+            Some(&format!(r#"{{"hotspot":"{HOTSPOT_A}"}}"#)),
+        )
+        .await;
+        assert!(body.contains("\"persisted\":true"), "body was {body}");
+
+        // Removing a region that came from settings must also stick.
+        let (status, _) =
+            common::http(api, "DELETE", "/api/v1/deny-list/regions/AU915", None, None).await;
+        assert_eq!(status, 200);
+
+        shutdown.trigger();
+    }
+
+    assert!(store.exists(), "store file should have been written");
+
+    // Second run: a fresh State reading the same store.
+    {
+        let grpc_addr = common::available_port().await;
+        let (_shutdown, api) = common::start_server_with_api(&settings, grpc_addr).await;
+        let mut client = common::connect_client(grpc_addr).await;
+
+        let (_, body) = common::http(api, "GET", "/api/v1/deny-list", None, None).await;
+        assert!(
+            body.contains("EU868"),
+            "added region should persist: {body}"
+        );
+        assert!(
+            body.contains(HOTSPOT_A),
+            "added hotspot should persist: {body}"
+        );
+        assert!(
+            !body.contains("AU915"),
+            "a removal of a configured region should persist: {body}"
+        );
+
+        // The restored lists are live on the gRPC path, not just in the API view.
+        let res = common::inc(&mut client, "k1", vec![], Region::Eu868 as i32).await;
+        assert!(res.denied, "restored region should deny");
+        let res = common::inc(&mut client, "k2", HOTSPOT_A.as_bytes().to_vec(), 5).await;
+        assert!(res.denied, "restored hotspot should deny");
+        let res = common::inc(&mut client, "k3", vec![], Region::Au915 as i32).await;
+        assert!(!res.denied, "removed region should stay allowed");
+    }
+
+    std::fs::remove_file(&store).ok();
+}
+
+#[tokio::test]
+async fn config_additions_still_apply_after_persisting() {
+    let store = common::temp_store_path("config-add");
+
+    // First run persists an API-added region.
+    {
+        let mut settings = common::test_settings();
+        settings.deny_list_store = store.clone();
+        let grpc_addr = common::available_port().await;
+        let (shutdown, api) = common::start_server_with_api(&settings, grpc_addr).await;
+        let (status, _) = common::http(
+            api,
+            "POST",
+            "/api/v1/deny-list/regions",
+            None,
+            Some(r#"{"region":"KR920"}"#),
+        )
+        .await;
+        assert_eq!(status, 200);
+        shutdown.trigger();
+    }
+
+    // Second run adds a region to settings: the store must not shadow it.
+    {
+        let mut settings = common::test_settings_with_deny_lists(vec![], vec!["IN865".to_string()]);
+        settings.deny_list_store = store.clone();
+        let grpc_addr = common::available_port().await;
+        let (_shutdown, api) = common::start_server_with_api(&settings, grpc_addr).await;
+
+        let (_, body) = common::http(api, "GET", "/api/v1/deny-list/regions", None, None).await;
+        assert!(body.contains("KR920"), "persisted region missing: {body}");
+        assert!(
+            body.contains("IN865"),
+            "newly configured region should apply: {body}"
+        );
+    }
+
+    std::fs::remove_file(&store).ok();
+}
+
+#[tokio::test]
+async fn unpersisted_changes_are_reported_as_such() {
+    // Persistence off: the change still applies, but says it won't survive.
+    let settings = common::test_settings();
+    let grpc_addr = common::available_port().await;
+    let (_shutdown, api) = common::start_server_with_api(&settings, grpc_addr).await;
+
+    let (status, body) = common::http(
+        api,
+        "POST",
+        "/api/v1/deny-list/regions",
+        None,
+        Some(r#"{"region":"EU868"}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "the change should still be applied");
+    assert!(body.contains("\"persisted\":false"), "body was {body}");
+    assert!(body.contains("in memory only"), "body was {body}");
+
+    let (_, body) = common::http(api, "GET", "/api/v1/info", None, None).await;
+    assert!(body.contains("\"persistent\":false"), "body was {body}");
 }

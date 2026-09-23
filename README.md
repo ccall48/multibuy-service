@@ -11,8 +11,8 @@ As packets come in to HPR A and HPR B, they will check in with Multi-Buy service
 ## Features
 
 - Distributed packet counter across load-balanced HPR instances
-- Hotspot and region deny lists, editable at runtime over HTTP
-- Admin API + metrics dashboard
+- Hotspot and region deny lists, editable at runtime over HTTP and persisted across restarts
+- Admin API + metrics dashboard, with Angry Purple Tiger animal names for hotspots
 - Prometheus metrics endpoint
 - Automatic cache cleanup (configurable, default 30 minutes)
 - Graceful shutdown via SIGTERM/SIGINT
@@ -68,7 +68,9 @@ cargo nextest run
 ```bash
 docker build -t multibuy-service .
 
-docker run -p 6080:6080 -p 6081:6081 -p 19011:19011 multibuy-service
+# -v keeps deny-list changes across container replacement
+docker run -p 6080:6080 -p 6081:6081 -p 19011:19011 \
+  -v multibuy-data:/app/data multibuy-service
 ```
 
 ## Configuration
@@ -91,6 +93,10 @@ grpc_listen = "0.0.0.0:6080"
 # Region names to deny (e.g., "US915", "EU868")
 # Env: MB__DENIED_REGIONS
 # denied_regions = []
+
+# Where admin API deny-list changes are persisted; "" = in memory only
+# Env: MB__DENY_LIST_STORE
+# deny_list_store = "deny-list.json"
 
 # Prometheus metrics endpoint
 [metrics]
@@ -125,6 +131,7 @@ listen = "0.0.0.0:6081"
 | `MB__API__ENABLED` | Run the admin API and dashboard | `true` |
 | `MB__API__LISTEN` | Admin API / dashboard listen address | `0.0.0.0:6081` |
 | `MB__API__AUTH_TOKEN` | Bearer token required on API requests | unset (no auth) |
+| `MB__DENY_LIST_STORE` | Where API deny-list changes are persisted (`""` disables) | `deny-list.json` |
 
 ## Metrics
 
@@ -152,9 +159,8 @@ If `api.auth_token` is set the page prompts for it on first load and keeps it in
 ## Admin API
 
 Deny-list changes take effect on the very next `inc` request — no restart and no
-config reload. They are **in-memory only**: after a restart the service is back
-to whatever `denied_hotspots` / `denied_regions` say, so persist anything
-long-lived in your config or deployment manifest.
+config reload — and are persisted so they survive one (see
+[Persistence](#persistence)).
 
 All `/api/v1/*` routes require `Authorization: Bearer <api.auth_token>` when that
 token is configured. `/` and `/health` are always open.
@@ -166,6 +172,7 @@ token is configured. `/` and `/health` are always open.
 | `GET` | `/api/v1/info` | Version, listen addresses, uptime |
 | `GET` | `/api/v1/metrics` | Prometheus payload, rendered in-process |
 | `GET` | `/api/v1/regions` | Every region name the proto accepts |
+| `GET` | `/api/v1/animal-name/{key}` | Animal name for an address, without changing anything |
 | `GET` | `/api/v1/deny-list` | Both deny lists |
 | `GET` | `/api/v1/deny-list/hotspots` | Denied hotspots |
 | `POST` | `/api/v1/deny-list/hotspots` | Add hotspots |
@@ -191,15 +198,74 @@ Hotspot keys are checked because HPR sends the base58 address as bytes and the
 deny list matches it exactly — a typo would otherwise sit in the list, silently
 matching nothing.
 
-Responses report what actually changed alongside the resulting list:
+Responses report what actually changed, the resulting list, and whether the
+change was persisted:
 
 ```json
 {
   "changed": ["EU868"],
   "unchanged": [],
-  "regions": ["EU868"]
+  "regions": ["EU868"],
+  "persisted": true
 }
 ```
+
+Denied hotspots are returned as objects carrying the
+[Angry Purple Tiger](https://github.com/helium/angry-purple-tiger-rs) animal
+name — the same name shown in Helium explorers and wallets — so a deny list can
+be reviewed by eye:
+
+```json
+{
+  "count": 1,
+  "hotspots": [
+    {
+      "address": "13QZwkEXgjE3WzWzy6DvJ1dqKsZM5s3fc4pkFpFb2yME2nRRnJv",
+      "name": "mean-gingerbread-seal"
+    }
+  ]
+}
+```
+
+Names are derived on demand from the address, never stored, and never computed on
+the request path (it is an md5 per call, and a denied region would otherwise pay
+it on every packet).
+
+## Persistence
+
+Deny-list edits are written to `deny_list_store` (default `deny-list.json`,
+relative to the working directory). Set it to `""` to keep changes in memory
+only; the dashboard and `/api/v1/info` both say which mode is active.
+
+The settings file stays the **baseline**. The store records only how the live
+lists differ from it:
+
+```json
+{
+  "version": 1,
+  "hotspots": { "added": ["13QZwk…"], "removed": [] },
+  "regions": { "added": ["EU868"], "removed": ["AU915"] }
+}
+```
+
+The effective deny list at startup is `(config ∪ added) \ removed`. This means:
+
+- A region added to `denied_regions` in your manifest still takes effect on the
+  next restart, even though a store file exists.
+- A region an operator removed through the API stays removed — that is what
+  `removed` is for. Because it contradicts the settings file, each suppressed
+  entry is logged as a warning at startup.
+- Re-adding something that was removed simply drops its tombstone.
+
+Writes go to a temporary file and are renamed into place, so a crash mid-write
+leaves the previous file intact. If the file is ever unreadable or malformed the
+service does **not** refuse to start — HPRs losing multibuy coordination is worse
+than a bad ops file — it logs an error, moves the file to `<path>.corrupt`, and
+starts from the configured lists.
+
+A mutation whose write fails still applies in memory and returns `200` with
+`"persisted": false` and a `warning`, since dropping the live change would be
+worse than losing its durability.
 
 ### Examples
 
@@ -224,4 +290,8 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 # Stop denying a region
 curl -s -X DELETE -H "Authorization: Bearer $TOKEN" \
   $API/api/v1/deny-list/regions/EU868
+
+# Check which hotspot an address is, before denying it
+curl -s -H "Authorization: Bearer $TOKEN" \
+  $API/api/v1/animal-name/13QZwkEXgjE3WzWzy6DvJ1dqKsZM5s3fc4pkFpFb2yME2nRRnJv
 ```

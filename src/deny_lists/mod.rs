@@ -1,6 +1,11 @@
+pub mod store;
+
+use angry_purple_tiger::AnimalName;
 use dashmap::DashSet;
 use helium_proto::services::multi_buy::MultiBuyIncReqV1;
 use helium_proto::Region;
+use std::collections::HashSet;
+pub use store::{Delta, DenyListDeltas, DenyListStore};
 
 /// Highest proto enum value scanned when enumerating known regions.
 /// `helium.region` is sparse (0..=27 plus `UNKNOWN = 99`), so invalid
@@ -18,6 +23,10 @@ pub struct DenyLists {
     hotspots: DashSet<String>,
     /// Proto region enum values to deny.
     regions: DashSet<i32>,
+    /// The configured lists, kept so runtime changes can be persisted as a
+    /// delta against them. See [`store`].
+    config_hotspots: HashSet<String>,
+    config_regions: HashSet<String>,
 }
 
 impl DenyLists {
@@ -30,21 +39,92 @@ impl DenyLists {
         hotspot_keys_b58: &[String],
         region_names: &[String],
     ) -> anyhow::Result<Self> {
-        let hotspots: DashSet<String> = hotspot_keys_b58
+        Self::from_config_and_deltas(hotspot_keys_b58, region_names, &DenyListDeltas::default())
+    }
+
+    /// Parse deny lists from config, then apply persisted runtime changes on
+    /// top: `(config ∪ added) \ removed`.
+    ///
+    /// Returns the lists plus any config entries a stored removal suppressed —
+    /// surprising enough that the caller should log them.
+    pub fn from_config_and_deltas_reporting(
+        hotspot_keys_b58: &[String],
+        region_names: &[String],
+        deltas: &DenyListDeltas,
+    ) -> anyhow::Result<(Self, Vec<String>)> {
+        let config_hotspots: HashSet<String> = hotspot_keys_b58
             .iter()
             .filter(|k| !k.is_empty())
             .cloned()
             .collect();
 
-        let regions = DashSet::new();
-        for name in region_names {
-            if name.is_empty() {
-                continue;
+        // Normalise configured regions through the proto so the baseline and the
+        // stored names agree on spelling.
+        let mut config_regions: HashSet<String> = HashSet::new();
+        for name in region_names.iter().filter(|n| !n.is_empty()) {
+            config_regions.insert(parse_region(name)?.as_str_name().to_string());
+        }
+
+        let mut suppressed = Vec::new();
+
+        let hotspots = DashSet::new();
+        for key in &config_hotspots {
+            if deltas.hotspots.removed.contains(key) {
+                suppressed.push(format!("hotspot {key}"));
+            } else {
+                hotspots.insert(key.clone());
             }
+        }
+        for key in &deltas.hotspots.added {
+            hotspots.insert(key.clone());
+        }
+
+        let regions = DashSet::new();
+        for name in &config_regions {
+            if deltas.regions.removed.contains(name) {
+                suppressed.push(format!("region {name}"));
+            } else {
+                regions.insert(parse_region(name)? as i32);
+            }
+        }
+        for name in &deltas.regions.added {
             regions.insert(parse_region(name)? as i32);
         }
 
-        Ok(Self { hotspots, regions })
+        suppressed.sort();
+
+        Ok((
+            Self {
+                hotspots,
+                regions,
+                config_hotspots,
+                config_regions,
+            },
+            suppressed,
+        ))
+    }
+
+    /// As [`Self::from_config_and_deltas_reporting`], discarding the report.
+    pub fn from_config_and_deltas(
+        hotspot_keys_b58: &[String],
+        region_names: &[String],
+        deltas: &DenyListDeltas,
+    ) -> anyhow::Result<Self> {
+        Self::from_config_and_deltas_reporting(hotspot_keys_b58, region_names, deltas)
+            .map(|(lists, _)| lists)
+    }
+
+    /// How the live lists currently differ from the configured ones — what gets
+    /// written to the store.
+    pub fn deltas(&self) -> DenyListDeltas {
+        let live_hotspots: HashSet<String> = self.hotspots.iter().map(|k| k.clone()).collect();
+        let live_regions: HashSet<String> = self.region_names().into_iter().collect();
+
+        DenyListDeltas {
+            version: 1,
+            hotspots: Delta::between(&self.config_hotspots, &live_hotspots),
+            regions: Delta::between(&self.config_regions, &live_regions),
+        }
     }
 
     /// Returns `true` if the request should be denied based on hotspot key or region.
@@ -118,6 +198,22 @@ pub fn all_region_names() -> Vec<&'static str> {
         .filter_map(|v| Region::try_from(v).ok())
         .map(|r| r.as_str_name())
         .collect()
+}
+
+/// The Angry Purple Tiger animal name for a hotspot address, e.g.
+/// "feisty-glass-dalmatian".
+///
+/// This is the name operators see in Helium explorers and wallets, so showing it
+/// beside the raw b58 address makes a deny list reviewable by eye. Derived by
+/// hashing the address string, exactly as the rest of the Helium tooling does.
+///
+/// Deliberately not called on the request path: it is an md5 per call, and a
+/// denied region would pay it on every packet.
+pub fn animal_name(key_b58: &str) -> String {
+    key_b58
+        .parse::<AnimalName>()
+        .map(|name| name.to_string())
+        .unwrap_or_default()
 }
 
 /// Validate a base58check-encoded hotspot address.
@@ -219,6 +315,95 @@ mod tests {
         for name in names {
             assert!(parse_region(name).is_ok(), "{name} should parse");
         }
+    }
+
+    #[test]
+    fn animal_name_matches_helium_tooling() {
+        // Reference pair from the angry-purple-tiger crate's own test vector.
+        assert_eq!(
+            animal_name("112CuoXo7WCcp6GGwDNBo6H5nKXGH45UNJ39iEefdv2mwmnwdFt8"),
+            "feisty-glass-dalmatian"
+        );
+        // Stable and of the adjective-color-animal shape for other addresses.
+        let name = animal_name("13QZwkEXgjE3WzWzy6DvJ1dqKsZM5s3fc4pkFpFb2yME2nRRnJv");
+        assert_eq!(name.split('-').count(), 3, "name was {name}");
+        assert_eq!(
+            name,
+            animal_name("13QZwkEXgjE3WzWzy6DvJ1dqKsZM5s3fc4pkFpFb2yME2nRRnJv")
+        );
+    }
+
+    #[test]
+    fn deltas_are_empty_for_a_fresh_config() {
+        let deny = DenyLists::from_config(&["hotspot-a".into()], &["EU868".into()]).unwrap();
+        let deltas = deny.deltas();
+        assert!(deltas.hotspots.is_empty());
+        assert!(deltas.regions.is_empty());
+    }
+
+    #[test]
+    fn deltas_capture_additions_and_removals_against_config() {
+        let deny = DenyLists::from_config(&["hotspot-a".into()], &["EU868".into()]).unwrap();
+
+        deny.add_hotspot("hotspot-b");
+        deny.remove_hotspot("hotspot-a");
+        deny.add_region("KR920").unwrap();
+        deny.remove_region("EU868").unwrap();
+
+        let deltas = deny.deltas();
+        assert_eq!(deltas.hotspots.added, vec!["hotspot-b"]);
+        assert_eq!(deltas.hotspots.removed, vec!["hotspot-a"]);
+        assert_eq!(deltas.regions.added, vec!["KR920"]);
+        assert_eq!(deltas.regions.removed, vec!["EU868"]);
+    }
+
+    #[test]
+    fn stored_deltas_are_applied_over_config() {
+        let deltas = DenyListDeltas {
+            version: 1,
+            hotspots: Delta {
+                added: vec!["hotspot-b".into()],
+                removed: vec!["hotspot-a".into()],
+            },
+            regions: Delta {
+                added: vec!["KR920".into()],
+                removed: vec!["EU868".into()],
+            },
+        };
+
+        let (deny, suppressed) = DenyLists::from_config_and_deltas_reporting(
+            &["hotspot-a".into()],
+            &["EU868".into()],
+            &deltas,
+        )
+        .unwrap();
+
+        assert_eq!(deny.hotspots(), vec!["hotspot-b"]);
+        assert_eq!(deny.region_names(), vec!["KR920"]);
+        // The config entries a tombstone suppressed are reported for logging.
+        assert_eq!(suppressed, vec!["hotspot hotspot-a", "region EU868"]);
+
+        // Round-tripping reproduces the same deltas.
+        assert_eq!(deny.deltas(), deltas);
+    }
+
+    #[test]
+    fn config_entries_added_after_a_restart_still_apply() {
+        // A stored delta must not freeze the configured baseline: a region newly
+        // added to the settings file takes effect even though a store exists.
+        let deltas = DenyListDeltas {
+            version: 1,
+            regions: Delta {
+                added: vec!["KR920".into()],
+                removed: vec![],
+            },
+            ..Default::default()
+        };
+
+        let deny =
+            DenyLists::from_config_and_deltas(&[], &["EU868".into(), "AU915".into()], &deltas)
+                .unwrap();
+        assert_eq!(deny.region_names(), vec!["AU915", "EU868", "KR920"]);
     }
 
     #[test]

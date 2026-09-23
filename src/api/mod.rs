@@ -2,12 +2,12 @@
 //!
 //! The deny lists are held behind concurrent sets shared with the gRPC handler,
 //! so every mutation here applies to the very next `inc` request — no restart,
-//! no config reload. Changes are in-memory only: on restart the service falls
-//! back to `denied_hotspots` / `denied_regions` from settings.
+//! no config reload. Changes are also written to the deny-list store (see
+//! [`crate::deny_lists::store`]) so they survive a restart.
 
 pub mod settings;
 
-use crate::deny_lists::{self, DenyLists};
+use crate::deny_lists::{self, DenyListStore, DenyLists};
 use axum::{
     extract::{Path, Request, State},
     http::{header, HeaderMap, StatusCode},
@@ -29,6 +29,7 @@ const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 #[derive(Clone)]
 pub struct ApiState {
     deny_lists: Arc<DenyLists>,
+    store: Arc<DenyListStore>,
     metrics: PrometheusHandle,
     auth_token: Option<Arc<String>>,
     grpc_listen: SocketAddr,
@@ -39,6 +40,7 @@ pub struct ApiState {
 impl ApiState {
     pub fn new(
         deny_lists: Arc<DenyLists>,
+        store: Arc<DenyListStore>,
         metrics: PrometheusHandle,
         auth_token: Option<String>,
         grpc_listen: SocketAddr,
@@ -46,6 +48,7 @@ impl ApiState {
     ) -> Self {
         Self {
             deny_lists,
+            store,
             metrics,
             auth_token: auth_token.map(Arc::new),
             grpc_listen,
@@ -67,6 +70,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/v1/info", get(info))
         .route("/api/v1/metrics", get(metrics))
         .route("/api/v1/regions", get(known_regions))
+        .route("/api/v1/animal-name/{hotspot}", get(lookup_animal_name))
         .route("/api/v1/deny-list", get(get_deny_list))
         .route(
             "/api/v1/deny-list/hotspots",
@@ -190,6 +194,9 @@ struct Info {
     metrics_endpoint: String,
     uptime_seconds: u64,
     auth_required: bool,
+    /// Whether deny-list changes survive a restart.
+    persistent: bool,
+    deny_list_store: Option<String>,
 }
 
 async fn info(State(state): State<ApiState>) -> Json<Info> {
@@ -199,6 +206,8 @@ async fn info(State(state): State<ApiState>) -> Json<Info> {
         metrics_endpoint: state.metrics_endpoint.to_string(),
         uptime_seconds: state.started_at.elapsed().as_secs(),
         auth_required: state.auth_token.is_some(),
+        persistent: state.store.is_enabled(),
+        deny_list_store: state.store.path().map(|p| p.display().to_string()),
     })
 }
 
@@ -226,15 +235,51 @@ async fn known_regions() -> Json<KnownRegions> {
     })
 }
 
+/// A denied hotspot, with the Angry Purple Tiger name operators recognise from
+/// Helium explorers and wallets alongside the raw address.
+#[derive(Serialize)]
+struct HotspotEntry {
+    address: String,
+    name: String,
+}
+
+impl HotspotEntry {
+    fn new(address: String) -> Self {
+        let name = deny_lists::animal_name(&address);
+        Self { address, name }
+    }
+
+    fn list(addresses: Vec<String>) -> Vec<Self> {
+        addresses.into_iter().map(Self::new).collect()
+    }
+}
+
+#[derive(Serialize)]
+struct AnimalNameView {
+    address: String,
+    name: String,
+}
+
+/// Resolve an address to its animal name without changing anything, so an
+/// operator can confirm they have the right hotspot before denying it.
+async fn lookup_animal_name(Path(hotspot): Path<String>) -> Result<Json<AnimalNameView>, ApiError> {
+    deny_lists::validate_hotspot_key(&hotspot)
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(AnimalNameView {
+        name: deny_lists::animal_name(&hotspot),
+        address: hotspot,
+    }))
+}
+
 #[derive(Serialize)]
 struct DenyListView {
-    hotspots: Vec<String>,
+    hotspots: Vec<HotspotEntry>,
     regions: Vec<String>,
 }
 
 async fn get_deny_list(State(state): State<ApiState>) -> Json<DenyListView> {
     Json(DenyListView {
-        hotspots: state.deny_lists.hotspots(),
+        hotspots: HotspotEntry::list(state.deny_lists.hotspots()),
         regions: state.deny_lists.region_names(),
     })
 }
@@ -242,14 +287,14 @@ async fn get_deny_list(State(state): State<ApiState>) -> Json<DenyListView> {
 #[derive(Serialize)]
 struct HotspotsView {
     count: usize,
-    hotspots: Vec<String>,
+    hotspots: Vec<HotspotEntry>,
 }
 
 async fn get_hotspots(State(state): State<ApiState>) -> Json<HotspotsView> {
     let hotspots = state.deny_lists.hotspots();
     Json(HotspotsView {
         count: hotspots.len(),
-        hotspots,
+        hotspots: HotspotEntry::list(hotspots),
     })
 }
 
@@ -308,11 +353,16 @@ impl RegionsBody {
 #[derive(Serialize)]
 struct HotspotMutation {
     /// Entries whose presence in the deny list actually changed.
-    changed: Vec<String>,
+    changed: Vec<HotspotEntry>,
     /// Entries that were already in (or already absent from) the deny list.
-    unchanged: Vec<String>,
+    unchanged: Vec<HotspotEntry>,
     /// The full deny list after the change.
-    hotspots: Vec<String>,
+    hotspots: Vec<HotspotEntry>,
+    /// Whether the change was written to the deny-list store. False means it is
+    /// live but will not survive a restart; `warning` says why.
+    persisted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -320,6 +370,9 @@ struct RegionMutation {
     changed: Vec<String>,
     unchanged: Vec<String>,
     regions: Vec<String>,
+    persisted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
 }
 
 async fn add_hotspots(
@@ -465,10 +518,13 @@ fn hotspot_mutation(
 ) -> HotspotMutation {
     let hotspots = state.deny_lists.hotspots();
     crate::metrics::set_deny_list_size("hotspots", hotspots.len());
+    let (persisted, warning) = persist(state, &changed);
     HotspotMutation {
-        changed,
-        unchanged,
-        hotspots,
+        changed: HotspotEntry::list(changed),
+        unchanged: HotspotEntry::list(unchanged),
+        hotspots: HotspotEntry::list(hotspots),
+        persisted,
+        warning,
     }
 }
 
@@ -479,18 +535,62 @@ fn region_mutation(
 ) -> RegionMutation {
     let regions = state.deny_lists.region_names();
     crate::metrics::set_deny_list_size("regions", regions.len());
+    let (persisted, warning) = persist(state, &changed);
     RegionMutation {
         changed,
         unchanged,
         regions,
+        persisted,
+        warning,
+    }
+}
+
+/// Write the current deltas to the store.
+///
+/// The in-memory change has already taken effect, so a failed write is reported
+/// rather than turned into an error response — losing the live change would be
+/// worse than losing its durability. Nothing to persist means nothing to warn
+/// about.
+fn persist(state: &ApiState, changed: &[String]) -> (bool, Option<String>) {
+    if !state.store.is_enabled() {
+        let warning = (!changed.is_empty()).then(|| {
+            "deny_list_store is not configured; this change is in memory only".to_string()
+        });
+        return (false, warning);
+    }
+    if changed.is_empty() {
+        return (true, None);
+    }
+
+    match state.store.save(&state.deny_lists.deltas()) {
+        Ok(()) => (true, None),
+        Err(e) => {
+            tracing::error!("deny-list change applied but could not be persisted: {e}");
+            (
+                false,
+                Some(format!(
+                    "change is live but was not persisted, so it will be lost on restart: {e}"
+                )),
+            )
+        }
     }
 }
 
 fn log_change(action: &str, kind: &str, changed: &[String]) {
-    if !changed.is_empty() {
-        tracing::info!(
-            entries = ?changed,
-            "deny list {kind} {action} via admin API"
-        );
+    if changed.is_empty() {
+        return;
     }
+    // Hotspot addresses are unreadable at a glance, so log the animal name too.
+    let entries: Vec<String> = if kind == "hotspots" {
+        changed
+            .iter()
+            .map(|a| format!("{a} ({})", deny_lists::animal_name(a)))
+            .collect()
+    } else {
+        changed.to_vec()
+    };
+    tracing::info!(
+        entries = ?entries,
+        "deny list {kind} {action} via admin API"
+    );
 }

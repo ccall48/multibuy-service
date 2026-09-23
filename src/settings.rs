@@ -2,7 +2,7 @@ use config::{Config, Environment, File};
 use humantime_serde::re::humantime;
 use serde::Deserialize;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Debug, Deserialize)]
@@ -31,6 +31,13 @@ pub struct Settings {
     /// Region names to deny (e.g., "US915", "EU868")
     #[serde(default)]
     pub denied_regions: Vec<String>,
+    /// Where deny-list changes made through the admin API are persisted so they
+    /// survive a restart. Set to an empty string to keep changes in memory only.
+    ///
+    /// The file records how the live lists differ from `denied_hotspots` /
+    /// `denied_regions`, which stay the baseline.
+    #[serde(default = "default_deny_list_store")]
+    pub deny_list_store: PathBuf,
 }
 
 pub fn default_log() -> String {
@@ -39,6 +46,10 @@ pub fn default_log() -> String {
 
 pub fn default_grpc_listen_addr() -> SocketAddr {
     "0.0.0.0:6080".parse().expect("invalid default socket addr")
+}
+
+pub fn default_deny_list_store() -> PathBuf {
+    PathBuf::from("deny-list.json")
 }
 
 pub fn default_cleanup_timeout() -> Duration {
@@ -160,6 +171,28 @@ mod tests {
                 assert!(!settings.api.enabled);
             },
         );
+    }
+
+    #[test]
+    fn deny_list_store_defaults_and_overrides() {
+        with_env_vars(&[], || {
+            let settings = Settings::new::<String>(None).unwrap();
+            assert_eq!(settings.deny_list_store, PathBuf::from("deny-list.json"));
+        });
+
+        with_env_vars(&[("MB__DENY_LIST_STORE", "/var/lib/mb/deny.json")], || {
+            let settings = Settings::new::<String>(None).unwrap();
+            assert_eq!(
+                settings.deny_list_store,
+                PathBuf::from("/var/lib/mb/deny.json")
+            );
+        });
+
+        // Empty disables persistence, consistent with the deny-list env vars.
+        with_env_vars(&[("MB__DENY_LIST_STORE", "")], || {
+            let settings = Settings::new::<String>(None).unwrap();
+            assert_eq!(settings.deny_list_store, PathBuf::from(""));
+        });
     }
 
     #[test]

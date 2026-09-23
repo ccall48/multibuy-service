@@ -17,3 +17,8 @@ CLAUDE.md
 .claude/
 
 settings.toml
+
+# Deny-list persistence (default path is relative to the working directory)
+deny-list.json
+deny-list.json.tmp
+deny-list.corrupt
