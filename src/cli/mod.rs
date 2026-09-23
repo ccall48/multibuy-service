@@ -29,8 +29,8 @@ impl Cli {
             Cmd::Server(server) => {
                 let settings = Settings::new(self.config)?;
                 custom_tracing::init(settings.log.clone(), settings.custom_tracing.clone()).await?;
-                crate::metrics::start_metrics(&settings.metrics)?;
-                server.run(&settings).await
+                let metrics_handle = crate::metrics::start_metrics(&settings.metrics)?;
+                server.run(&settings, metrics_handle).await
             }
         }
     }

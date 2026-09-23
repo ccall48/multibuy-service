@@ -18,3 +18,15 @@ grpc_listen = "0.0.0.0:6080"
 [metrics]
 # Env: MB__METRICS__ENDPOINT
 endpoint = "0.0.0.0:19011"
+
+# Admin API and metrics dashboard
+[api]
+# Env: MB__API__ENABLED
+enabled = true
+# Env: MB__API__LISTEN
+listen = "0.0.0.0:6081"
+# Shared secret required as `Authorization: Bearer <token>` on API requests.
+# Unset means the API is unauthenticated, so bind `listen` somewhere only
+# trusted operators can reach.
+# Env: MB__API__AUTH_TOKEN
+# auth_token = "change-me"

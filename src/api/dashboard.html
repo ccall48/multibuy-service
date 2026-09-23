@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Multibuy Service</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-2: #1d2129;
+    --border: #272c36;
+    --text: #e6e9ef;
+    --muted: #8b93a5;
+    --accent: #4f8cff;
+    --ok: #3ddc97;
+    --warn: #ffb454;
+    --bad: #ff6b6b;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f7f9; --panel: #fff; --panel-2: #f0f2f5; --border: #dfe3ea;
+      --text: #1a1d24; --muted: #6b7280; --accent: #2563eb;
+      --ok: #16a34a; --warn: #d97706; --bad: #dc2626;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+    padding: 18px 24px; border-bottom: 1px solid var(--border); background: var(--panel);
+  }
+  header h1 { font-size: 17px; margin: 0; font-weight: 600; letter-spacing: .2px; }
+  header .meta { color: var(--muted); font-size: 12px; font-family: var(--mono); }
+  header .spacer { flex: 1; }
+  main { padding: 20px 24px 48px; max-width: 1200px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em;
+       color: var(--muted); margin: 28px 0 12px; font-weight: 600; }
+  .cards { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .card .label { color: var(--muted); font-size: 12px; }
+  .card .value { font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 4px; }
+  .card .sub { color: var(--muted); font-size: 12px; font-family: var(--mono); min-height: 18px; }
+  .card svg { display: block; width: 100%; height: 34px; margin-top: 6px; }
+  .panels { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .panel > .head { display: flex; align-items: center; gap: 8px;
+                   padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  .panel > .head strong { font-size: 13px; font-weight: 600; }
+  .panel > .head .count { color: var(--muted); font-size: 12px; font-family: var(--mono); }
+  .panel > .body { padding: 14px 16px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  input, select, button, textarea {
+    font: inherit; color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--border); border-radius: 7px; padding: 7px 10px;
+  }
+  input, select { min-width: 0; flex: 1; }
+  input.mono { font-family: var(--mono); font-size: 12px; }
+  button { cursor: pointer; background: var(--accent); border-color: transparent; color: #fff; font-weight: 500; }
+  button:hover { filter: brightness(1.08); }
+  button:disabled { opacity: .55; cursor: default; }
+  button.ghost { background: transparent; color: var(--muted); border-color: var(--border); font-weight: 400; }
+  button.ghost:hover { color: var(--text); }
+  ul.entries { list-style: none; margin: 12px 0 0; padding: 0; max-height: 300px; overflow: auto; }
+  ul.entries li { display: flex; align-items: center; gap: 10px;
+                  padding: 7px 0; border-top: 1px solid var(--border); }
+  ul.entries li span { font-family: var(--mono); font-size: 12px; word-break: break-all; flex: 1; }
+  ul.entries li button { padding: 3px 9px; font-size: 12px; }
+  .empty { color: var(--muted); font-size: 13px; padding: 12px 0 2px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 10px; border-top: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  td.num { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  td.name { font-family: var(--mono); font-size: 12px; word-break: break-all; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; }
+  .dot.live { background: var(--ok); }
+  .dot.down { background: var(--bad); }
+  .toast { position: fixed; right: 18px; bottom: 18px; display: grid; gap: 8px; z-index: 10; }
+  .toast div { background: var(--panel); border: 1px solid var(--border);
+               border-left: 3px solid var(--accent); border-radius: 8px;
+               padding: 10px 14px; max-width: 420px; box-shadow: 0 8px 24px rgba(0,0,0,.25); }
+  .toast div.err { border-left-color: var(--bad); }
+  .toast div.ok { border-left-color: var(--ok); }
+  .toast div small { display: block; color: var(--muted); font-family: var(--mono); font-size: 11px; margin-top: 3px; }
+  details.raw { margin-top: 28px; }
+  details.raw summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+  details.raw pre { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+                    padding: 14px; overflow: auto; max-height: 420px; font-size: 12px; }
+  @media (max-width: 640px) {
+    header, main { padding-left: 16px; padding-right: 16px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Multibuy Service</h1>
+  <span class="meta" id="hdr-meta">connecting…</span>
+  <span class="spacer"></span>
+  <span class="meta"><span class="dot" id="dot"></span> <span id="hdr-poll">–</span></span>
+  <button class="ghost" id="btn-token">Set token</button>
+</header>
+
+<main>
+  <h2>Metrics</h2>
+  <div class="cards" id="cards"></div>
+
+  <h2>Deny lists <span style="text-transform:none;letter-spacing:0;font-weight:400">— changes apply to the next request, no restart</span></h2>
+  <div class="panels">
+    <section class="panel">
+      <div class="head"><strong>Denied regions</strong><span class="count" id="region-count"></span></div>
+      <div class="body">
+        <div class="row">
+          <select id="region-select"><option value="">loading…</option></select>
+          <button id="region-add">Deny</button>
+        </div>
+        <ul class="entries" id="region-list"></ul>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="head"><strong>Denied hotspots</strong><span class="count" id="hotspot-count"></span></div>
+      <div class="body">
+        <div class="row">
+          <input class="mono" id="hotspot-input" placeholder="base58 hotspot address" spellcheck="false" autocomplete="off">
+          <button id="hotspot-add">Deny</button>
+        </div>
+        <ul class="entries" id="hotspot-list"></ul>
+      </div>
+    </section>
+  </div>
+
+  <h2>All metrics</h2>
+  <div class="panel">
+    <table id="metrics-table"><tbody></tbody></table>
+  </div>
+
+  <details class="raw">
+    <summary>Raw Prometheus payload</summary>
+    <pre id="raw">–</pre>
+  </details>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+const POLL_MS = 5000;
+const HISTORY = 40;
+const $ = (id) => document.getElementById(id);
+const series = new Map();   // metric name -> [values]
+let lastCounters = new Map();
+let lastAt = null;
+let token = localStorage.getItem("mb_token") || "";
+
+// ------------------------------------------------------------ transport
+
+async function api(path, opts = {}) {
+  const headers = Object.assign({}, opts.headers);
+  if (token) headers["Authorization"] = "Bearer " + token;
+  if (opts.body) headers["Content-Type"] = "application/json";
+  const res = await fetch(path, Object.assign({}, opts, { headers }));
+  if (res.status === 401) {
+    promptToken(true);
+    throw new Error("unauthorized — set the admin token");
+  }
+  const text = await res.text();
+  if (!res.ok) {
+    let msg = text;
+    try {
+      const body = JSON.parse(text);
+      msg = body.error || text;
+      if (body.details && body.details.length) msg += " (" + body.details.join("; ") + ")";
+    } catch (_) {}
+    throw new Error(msg || res.status + " " + res.statusText);
+  }
+  return text;
+}
+
+const apiJson = async (path, opts) => JSON.parse(await api(path, opts));
+
+function toast(message, kind) {
+  const el = document.createElement("div");
+  el.className = kind || "";
+  el.textContent = message;
+  $("toast").appendChild(el);
+  setTimeout(() => el.remove(), kind === "err" ? 8000 : 4000);
+}
+
+function promptToken(force) {
+  const entered = window.prompt(
+    "Admin bearer token (leave blank if the API is unauthenticated):", token);
+  if (entered === null) return;
+  token = entered.trim();
+  localStorage.setItem("mb_token", token);
+  if (force !== true) toast(token ? "Token saved." : "Token cleared.", "ok");
+  refresh();
+}
+
+// ------------------------------------------------------------ prometheus parsing
+
+// Parse the text exposition format into {name, labels, value} samples.
+function parsePrometheus(text) {
+  const samples = [];
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const match = trimmed.match(/^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{.*\})?\s+(.+)$/);
+    if (!match) continue;
+    const value = parseFloat(match[3]);
+    if (!isFinite(value)) continue;
+    const labels = {};
+    if (match[2]) {
+      const inner = match[2].slice(1, -1);
+      const re = /([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"/g;
+      let m;
+      while ((m = re.exec(inner)) !== null) labels[m[1]] = m[2].replace(/\\"/g, '"');
+    }
+    samples.push({ name: match[1], labels, value });
+  }
+  return samples;
+}
+
+const findSample = (samples, name, labels) => samples.find((s) =>
+  s.name === name && Object.entries(labels || {}).every(([k, v]) => s.labels[k] === v));
+
+const valueOf = (samples, name, labels) => {
+  const found = findSample(samples, name, labels);
+  return found ? found.value : null;
+};
+
+const fmt = (n, digits = 0) => n === null || n === undefined || !isFinite(n)
+  ? "–"
+  : n.toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits });
+
+function sparkline(values) {
+  if (values.length < 2) return "";
+  const max = Math.max(...values, 0.0001);
+  const step = 100 / (values.length - 1);
+  const points = values.map((v, i) =>
+    (i * step).toFixed(2) + "," + (30 - (v / max) * 28).toFixed(2)).join(" ");
+  return '<svg viewBox="0 0 100 32" preserveAspectRatio="none" aria-hidden="true">' +
+    '<polyline points="' + points + '" fill="none" stroke="var(--accent)" ' +
+    'stroke-width="1.6" vector-effect="non-scaling-stroke"/></svg>';
+}
+
+function push(name, value) {
+  const list = series.get(name) || [];
+  list.push(value);
+  while (list.length > HISTORY) list.shift();
+  series.set(name, list);
+  return list;
+}
+
+// ------------------------------------------------------------ rendering
+
+function renderCards(samples, elapsedSeconds) {
+  const hits = valueOf(samples, "multi_buy_hit_total");
+  const denied = valueOf(samples, "multi_buy_denied_total");
+  const cache = valueOf(samples, "multi_buy_cache_size");
+  const p50 = valueOf(samples, "multi_buy_request_duration_ms", { quantile: "0.5" });
+  const p99 = valueOf(samples, "multi_buy_request_duration_ms", { quantile: "0.99" });
+
+  const rate = (name, current) => {
+    const previous = lastCounters.get(name);
+    lastCounters.set(name, current);
+    if (previous === undefined || current === null || !elapsedSeconds) return null;
+    const delta = current - previous;
+    return delta < 0 ? null : delta / elapsedSeconds;   // negative ⇒ restart
+  };
+
+  const hitRate = rate("hits", hits);
+  const denyRate = rate("denied", denied);
+  const hitSeries = hitRate === null ? [] : push("hits", hitRate);
+  const denySeries = denyRate === null ? [] : push("denied", denyRate);
+  const cacheSeries = cache === null ? [] : push("cache", cache);
+
+  const deniedPct = hits && denied !== null && hits > 0 ? (denied / hits) * 100 : null;
+
+  const cards = [
+    { label: "Requests", value: fmt(hits),
+      sub: hitRate === null ? "measuring…" : fmt(hitRate, 1) + " req/s", spark: hitSeries },
+    { label: "Denied", value: fmt(denied),
+      sub: deniedPct === null ? "–" : fmt(deniedPct, 2) + "% of requests" +
+           (denyRate === null ? "" : " · " + fmt(denyRate, 1) + "/s"), spark: denySeries },
+    { label: "Cache entries", value: fmt(cache), sub: "keys awaiting cleanup", spark: cacheSeries },
+    { label: "Latency", value: p50 === null ? "–" : fmt(p50, 2) + " ms",
+      sub: p99 === null ? "p50" : "p50 · p99 " + fmt(p99, 2) + " ms", spark: [] },
+  ];
+
+  $("cards").innerHTML = cards.map((c) =>
+    '<div class="card"><div class="label">' + c.label + '</div>' +
+    '<div class="value">' + c.value + '</div>' +
+    '<div class="sub">' + c.sub + '</div>' + sparkline(c.spark) + '</div>').join("");
+}
+
+function renderTable(samples) {
+  const rows = samples
+    .filter((s) => s.name.startsWith("multi_buy_"))
+    .map((s) => {
+      const labels = Object.entries(s.labels)
+        .map(([k, v]) => k + '="' + v + '"').join(", ");
+      return '<tr><td class="name">' + s.name +
+        (labels ? '<span style="color:var(--muted)">{' + labels + '}</span>' : "") +
+        '</td><td class="num">' +
+        s.value.toLocaleString(undefined, { maximumFractionDigits: 4 }) + "</td></tr>";
+    });
+  $("metrics-table").querySelector("tbody").innerHTML = rows.length
+    ? '<tr><th>Metric</th><th style="text-align:right">Value</th></tr>' + rows.join("")
+    : '<tr><td class="empty">No metrics reported yet.</td></tr>';
+}
+
+function renderList(kind, entries) {
+  const list = $(kind + "-list");
+  $(kind + "-count").textContent = entries.length + (entries.length === 1 ? " entry" : " entries");
+  if (!entries.length) {
+    list.innerHTML = '<li style="border:0"><span class="empty">Nothing denied.</span></li>';
+    return;
+  }
+  list.innerHTML = entries.map((entry) =>
+    "<li><span></span><button class='ghost'>Remove</button></li>").join("");
+  // Set text via textContent and wire handlers so entry values are never
+  // interpolated into HTML.
+  [...list.children].forEach((li, i) => {
+    li.querySelector("span").textContent = entries[i];
+    li.querySelector("button").onclick = () => removeEntry(kind, entries[i]);
+  });
+}
+
+// ------------------------------------------------------------ actions
+
+async function removeEntry(kind, value) {
+  const path = "/api/v1/deny-list/" + (kind === "region" ? "regions" : "hotspots") +
+    "/" + encodeURIComponent(value);
+  try {
+    await api(path, { method: "DELETE" });
+    toast("Removed " + value + " from the deny list.", "ok");
+    await loadDenyLists();
+  } catch (e) {
+    toast(e.message, "err");
+  }
+}
+
+async function addEntry(kind) {
+  const isRegion = kind === "region";
+  const field = isRegion ? $("region-select") : $("hotspot-input");
+  const value = field.value.trim();
+  if (!value) return;
+  const body = isRegion ? { region: value } : { hotspot: value };
+  try {
+    const result = await apiJson("/api/v1/deny-list/" + (isRegion ? "regions" : "hotspots"),
+      { method: "POST", body: JSON.stringify(body) });
+    toast(result.changed.length
+      ? "Denied " + result.changed.join(", ") + "."
+      : value + " was already denied.", "ok");
+    if (!isRegion) field.value = "";
+    await loadDenyLists();
+  } catch (e) {
+    toast(e.message, "err");
+  }
+}
+
+async function loadDenyLists() {
+  const denyList = await apiJson("/api/v1/deny-list");
+  renderList("region", denyList.regions);
+  renderList("hotspot", denyList.hotspots);
+}
+
+async function loadRegionOptions() {
+  const known = await apiJson("/api/v1/regions");
+  $("region-select").innerHTML = known.regions
+    .map((r) => "<option>" + r + "</option>").join("");
+}
+
+// ------------------------------------------------------------ poll loop
+
+async function refresh() {
+  try {
+    const raw = await api("/api/v1/metrics");
+    const now = Date.now();
+    const elapsed = lastAt ? (now - lastAt) / 1000 : null;
+    lastAt = now;
+
+    const samples = parsePrometheus(raw);
+    renderCards(samples, elapsed);
+    renderTable(samples);
+    $("raw").textContent = raw || "(empty)";
+
+    const info = await apiJson("/api/v1/info");
+    $("hdr-meta").textContent = "v" + info.version + " · gRPC " + info.grpc_listen +
+      " · scrape " + info.metrics_endpoint + " · up " + humanize(info.uptime_seconds);
+    $("btn-token").textContent = info.auth_required
+      ? (token ? "Change token" : "Set token")
+      : "Token (not required)";
+
+    await loadDenyLists();
+
+    $("dot").className = "dot live";
+    $("hdr-poll").textContent = "updated " + new Date().toLocaleTimeString();
+  } catch (e) {
+    $("dot").className = "dot down";
+    $("hdr-poll").textContent = "error";
+    $("hdr-meta").textContent = e.message;
+  }
+}
+
+function humanize(seconds) {
+  if (seconds < 60) return seconds + "s";
+  if (seconds < 3600) return Math.floor(seconds / 60) + "m";
+  if (seconds < 86400) return Math.floor(seconds / 3600) + "h " + Math.floor((seconds % 3600) / 60) + "m";
+  return Math.floor(seconds / 86400) + "d " + Math.floor((seconds % 86400) / 3600) + "h";
+}
+
+$("btn-token").onclick = () => promptToken();
+$("region-add").onclick = () => addEntry("region");
+$("hotspot-add").onclick = () => addEntry("hotspot");
+$("hotspot-input").addEventListener("keydown", (e) => { if (e.key === "Enter") addEntry("hotspot"); });
+
+loadRegionOptions().catch(() => {});
+refresh();
+setInterval(refresh, POLL_MS);
+</script>
+</body>
+</html>

@@ -20,6 +20,9 @@ pub struct Settings {
     /// Metrics settings
     #[serde(default)]
     pub metrics: crate::metrics::Settings,
+    /// Admin API and dashboard settings
+    #[serde(default)]
+    pub api: crate::api::Settings,
     #[serde(default = "default_cleanup_timeout", with = "humantime_serde")]
     pub cleanup_timeout: Duration,
     /// Base58-encoded hotspot public keys to deny
@@ -48,7 +51,8 @@ impl Settings {
     ///
     /// Environemnt overrides have the same name as the entries in the settings
     /// file in uppercase and prefixed with "MB__". For example
-    /// "MB__LOG" will override the log setting.
+    /// "MB__LOG" will override the log setting. Nested entries use "__" between
+    /// levels, so "MB__API__LISTEN" overrides `api.listen`.
     pub fn new<P: AsRef<Path>>(path: Option<P>) -> Result<Self, config::ConfigError> {
         let mut builder = Config::builder();
 
@@ -63,6 +67,10 @@ impl Settings {
             .add_source(
                 Environment::with_prefix("MB")
                     .prefix_separator("__")
+                    // Without this, nested keys like MB__METRICS__ENDPOINT are
+                    // read as the flat key "metrics__endpoint" and silently
+                    // ignored.
+                    .separator("__")
                     .try_parsing(true)
                     .list_separator(",")
                     .with_list_parse_key("denied_hotspots")
@@ -132,6 +140,35 @@ mod tests {
         with_env_vars(&[("MB__DENIED_HOTSPOTS", "key1,key2,key3")], || {
             let settings = Settings::new::<String>(None).unwrap();
             assert_eq!(settings.denied_hotspots, vec!["key1", "key2", "key3"]);
+        });
+    }
+
+    #[test]
+    fn nested_settings_from_env() {
+        with_env_vars(
+            &[
+                ("MB__METRICS__ENDPOINT", "127.0.0.1:19911"),
+                ("MB__API__LISTEN", "127.0.0.1:16081"),
+                ("MB__API__AUTH_TOKEN", "s3cret"),
+                ("MB__API__ENABLED", "false"),
+            ],
+            || {
+                let settings = Settings::new::<String>(None).unwrap();
+                assert_eq!(settings.metrics.endpoint.to_string(), "127.0.0.1:19911");
+                assert_eq!(settings.api.listen.to_string(), "127.0.0.1:16081");
+                assert_eq!(settings.api.auth_token.as_deref(), Some("s3cret"));
+                assert!(!settings.api.enabled);
+            },
+        );
+    }
+
+    #[test]
+    fn api_defaults() {
+        with_env_vars(&[], || {
+            let settings = Settings::new::<String>(None).unwrap();
+            assert!(settings.api.enabled);
+            assert_eq!(settings.api.listen.to_string(), "0.0.0.0:6081");
+            assert!(settings.api.auth_token.is_none());
         });
     }
 

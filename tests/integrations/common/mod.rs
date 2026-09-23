@@ -97,6 +97,112 @@ pub async fn start_server_with_cleanup(
     trigger
 }
 
+/// Start the gRPC server plus the admin API, sharing one `State` (and therefore
+/// one set of deny lists) between them — the same wiring the server binary uses.
+///
+/// Returns (shutdown_trigger, api_addr).
+pub async fn start_server_with_api(
+    settings: &Settings,
+    grpc_addr: SocketAddr,
+) -> (triggered::Trigger, SocketAddr) {
+    let state = State::new(settings).unwrap();
+    let api_state = multi_buy_service::api::ApiState::new(
+        state.deny_lists(),
+        metrics_exporter_prometheus::PrometheusBuilder::new()
+            .build_recorder()
+            .handle(),
+        settings.api.auth_token.clone(),
+        grpc_addr,
+        settings.metrics.endpoint,
+    );
+    let (trigger, shutdown) = triggered::trigger();
+
+    let grpc_incoming = TcpListener::bind(grpc_addr).await.unwrap();
+    let grpc_stream = tokio_stream::wrappers::TcpListenerStream::new(grpc_incoming);
+
+    let api_incoming = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_addr = api_incoming.local_addr().unwrap();
+
+    let grpc_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(MultiBuyServer::new(state))
+            .serve_with_incoming_shutdown(grpc_stream, grpc_shutdown)
+            .await
+            .unwrap();
+    });
+
+    tokio::spawn(async move {
+        axum::serve(api_incoming, multi_buy_service::api::router(api_state))
+            .with_graceful_shutdown(shutdown)
+            .await
+            .unwrap();
+    });
+
+    (trigger, api_addr)
+}
+
+/// A minimal HTTP request against the admin API, returning (status, body).
+///
+/// Hand-rolled to keep an HTTP client out of the dependency tree for one test
+/// helper; the API only needs simple, single-shot HTTP/1.1 requests here.
+pub async fn http(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<&str>,
+) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+    if let Some(token) = token {
+        request.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    match body {
+        Some(body) => {
+            request.push_str("Content-Type: application/json\r\n");
+            request.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+            request.push_str(body);
+        }
+        None => request.push_str("\r\n"),
+    }
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.unwrap();
+    let response = String::from_utf8_lossy(&raw).into_owned();
+
+    let status = response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("no status line in response: {response}"));
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
+
+    // Responses here are small and sent in one chunk, so strip the chunked
+    // framing rather than implementing a full decoder.
+    let body = if response
+        .to_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        body.split("\r\n")
+            .filter(|line| !line.is_empty() && u64::from_str_radix(line.trim(), 16).is_err())
+            .collect::<Vec<_>>()
+            .join("")
+    } else {
+        body
+    };
+
+    (status, body)
+}
+
 /// Connect a MultiBuyClient to the given address.
 pub async fn connect_client(addr: SocketAddr) -> MultiBuyClient<Channel> {
     let url = format!("http://{addr}");

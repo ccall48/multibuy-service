@@ -36,7 +36,7 @@ COPY --from=builder /app/target/release/multi_buy_service /app/multi_buy_service
 # Copy default settings
 COPY pkg/settings-template.toml /app/config/settings.toml
 
-EXPOSE 6080 19011
+EXPOSE 6080 6081 19011
 
 ENTRYPOINT ["/app/multi_buy_service"]
 CMD ["-c", "/app/config/settings.toml", "server"]
