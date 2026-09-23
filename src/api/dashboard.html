@@ -110,6 +110,11 @@
   .traffic rect.bar.hover { filter: brightness(1.25); }
   .traffic rect.silence { fill: var(--warn); opacity: .22; }
   .traffic rect.silence-edge { fill: var(--warn); }
+  .traffic line.conn { stroke-width: 1.5; }
+  .traffic .conn.opened { stroke: var(--ok); fill: var(--ok); }
+  .traffic .conn.closed { stroke: var(--bad); fill: var(--bad); }
+  .traffic .peer { font-family: var(--mono); font-size: 11px; color: var(--muted); word-break: break-all; }
+  .traffic h3 { font-size: 12px; font-weight: 600; color: var(--muted); margin: 18px 0 0; }
   .traffic .legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-bottom: 8px; }
   .traffic .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
   .traffic .tip { position: absolute; pointer-events: none; background: var(--panel-2); border: 1px solid var(--border);
@@ -159,10 +164,14 @@
     <div class="body">
       <div class="note" id="traffic-summary" style="margin:0 0 8px">–</div>
       <div class="legend"><span><i style="background:var(--accent)"></i>requests per bar</span>
-        <span><i style="background:var(--warn);opacity:.5"></i>silence (no requests arrived)</span></div>
+        <span><i style="background:var(--warn);opacity:.5"></i>silence (no requests arrived)</span>
+        <span><i style="background:var(--ok);width:3px"></i>HPR connected</span>
+        <span><i style="background:var(--bad);width:3px"></i>HPR disconnected</span></div>
       <div id="traffic-chart"></div>
       <div class="tip" id="traffic-tip"></div>
       <table id="silence-table"><tbody></tbody></table>
+      <h3>Connections</h3>
+      <table id="conn-table"><tbody></tbody></table>
       <div class="hint">HPR stops calling this service for a route while it backs off after a failed request
         (1s, doubling to 5 min). With <code>fail_on_unavailable</code> on, it drops those packets, so they
         appear here as silences in otherwise steady traffic.</div>
@@ -541,6 +550,7 @@ const GAP_KEY = "mb_min_gap";
 let minGap = 10;
 try { minGap = parseInt(localStorage.getItem(GAP_KEY), 10) || 10; } catch (_) {}
 let traffic = null;
+let conns = null;
 const RANGE_KEY = "mb_traffic_range";
 let range = 900;
 try { range = parseInt(localStorage.getItem(RANGE_KEY), 10) || 900; } catch (_) {}
@@ -554,7 +564,10 @@ function durationText(seconds) {
 }
 
 async function loadTraffic() {
-  traffic = await apiJson("/api/v1/traffic?min_gap=" + minGap);
+  [traffic, conns] = await Promise.all([
+    apiJson("/api/v1/traffic?min_gap=" + minGap),
+    apiJson("/api/v1/connections"),
+  ]);
   renderTraffic();
 }
 
@@ -598,6 +611,15 @@ function renderTraffic() {
       '" width="' + barW + '" height="' + h + '" rx="' + Math.min(2, barW / 2) + '"/>';
   });
 
+  // Connection opens/closes as thin full-height rules with a cap, drawn over
+  // the bars so a reconnect right after a silence is easy to spot.
+  const events = (conns ? conns.events : []).filter((ev) => ev.at >= from && ev.at <= end);
+  for (const ev of events) {
+    const px = Math.min(width - 1, Math.max(1, x(ev.at)));
+    svg += '<line class="conn ' + ev.kind + '" x1="' + px + '" x2="' + px + '" y1="' + top + '" y2="' + (top + plotH) + '"/>' +
+      '<circle class="conn ' + ev.kind + '" cx="' + px + '" cy="' + top + '" r="3"/>';
+  }
+
   // Recessive axis: baseline, a tick every 15 minutes, the peak value.
   svg += '<g class="axis"><line x1="0" x2="' + width + '" y1="' + (top + plotH) + '" y2="' + (top + plotH) + '"/>';
   for (let k = 4; k >= 0; k--) {
@@ -633,7 +655,10 @@ function renderTraffic() {
       "<b>" + fmt(sums[i]) + "</b> request" + (sums[i] === 1 ? "" : "s")) +
       "<small>" + clock(b0) + " – " + clock(b0 + bucket - 1) + "</small>" +
       (silence ? '<small style="color:var(--warn)">silent ' + durationText(silence.seconds) +
-        " from " + clock(silence.start) + (silence.ongoing ? " (ongoing)" : "") + "</small>" : "");
+        " from " + clock(silence.start) + (silence.ongoing ? " (ongoing)" : "") + "</small>" : "") +
+      events.filter((ev) => ev.at >= b0 && ev.at < b0 + bucket).map((ev) =>
+        '<small style="color:var(--' + (ev.kind === "opened" ? "ok" : "bad") + ')">' + clock(ev.at) + " " +
+        connText(ev) + "</small>").join("");
     tip.style.display = "block";
     const hostRect = host.parentElement.getBoundingClientRect();
     const left = e.clientX - hostRect.left + 12;
@@ -647,14 +672,43 @@ function renderTraffic() {
 
   // Summary + table view of the silences, newest first.
   const last = t.last_request ? "last request " + agoText(t.last_request) : "no requests in the last hour";
+  const reconnects = events.filter((ev) => ev.kind === "opened").length;
   $("traffic-summary").textContent = fmt(t.total) + " in window · " + last + " · " +
-    t.silences.length + " silence" + (t.silences.length === 1 ? "" : "s") + " ≥ " + t.min_gap + "s";
+    t.silences.length + " silence" + (t.silences.length === 1 ? "" : "s") + " ≥ " + t.min_gap + "s" +
+    (conns ? " · " + conns.active + " connection" + (conns.active === 1 ? "" : "s") + " open · " +
+      reconnects + " connect" + (reconnects === 1 ? "" : "s") + " in view" : "");
+  renderConnections();
   const rows = t.silences.slice().reverse().map((g) =>
     "<tr><td>" + clock(g.start) + "</td><td class=\"num\">" + durationText(g.seconds) + "</td><td>" +
     (g.ongoing ? '<span class="badge">ongoing</span>' : clock(g.start + g.seconds)) + "</td></tr>");
   $("silence-table").querySelector("tbody").innerHTML = rows.length
     ? "<tr><th>Silent from</th><th style=\"text-align:right\">For</th><th>Traffic resumed</th></tr>" + rows.join("")
     : '<tr><td class="empty">No silences of ' + t.min_gap + "s or longer since traffic began.</td></tr>";
+}
+
+function connText(ev) {
+  if (ev.kind === "opened") return "connected " + ev.peer;
+  return "disconnected " + ev.peer + " — " + ev.reason + " (open " + durationText(ev.open_seconds) +
+    ", idle " + durationText(ev.idle_seconds) + ")";
+}
+
+// Recent opens/closes, newest first. Closes carry why; "peer unresponsive"
+// means the link went dead (keepalive pings unanswered).
+function renderConnections() {
+  const tbody = $("conn-table").querySelector("tbody");
+  if (!conns) { tbody.innerHTML = ""; return; }
+  const rows = conns.events.slice(-25).reverse().map((ev) => {
+    const detail = ev.kind === "opened" ? "" : ev.reason + " · open " + durationText(ev.open_seconds) +
+      " · idle " + durationText(ev.idle_seconds);
+    const label = ev.kind === "opened"
+      ? '<span style="color:var(--ok)">● connected</span>'
+      : '<span style="color:var(--bad)">● disconnected</span>';
+    return "<tr><td>" + clock(ev.at) + "</td><td>" + label + '<div class="peer">' + ev.peer +
+      "</div></td><td>" + detail + "</td></tr>";
+  });
+  tbody.innerHTML = rows.length
+    ? "<tr><th>At</th><th>Event</th><th>Detail</th></tr>" + rows.join("")
+    : '<tr><td class="empty">No gRPC connections since the service started.</td></tr>';
 }
 
 $("range-select").value = String(range);

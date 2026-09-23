@@ -577,3 +577,44 @@ async fn traffic_endpoint_counts_grpc_requests() {
         "body was {body}"
     );
 }
+
+#[tokio::test]
+async fn connections_endpoint_records_open_and_close() {
+    let settings = common::test_settings();
+    let grpc_addr = common::available_port().await;
+    let (_shutdown, api) = common::start_server_with_api(&settings, grpc_addr).await;
+
+    let mut client = common::connect_client(grpc_addr).await;
+    common::inc(&mut client, "c1", vec![], Region::Us915 as i32).await;
+
+    let (status, body) = common::http(api, "GET", "/api/v1/connections", None, None).await;
+    assert_eq!(status, 200, "body was {body}");
+    let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(view["active"], 1, "body was {body}");
+    assert_eq!(view["opened_total"], 1, "body was {body}");
+    assert_eq!(view["events"][0]["kind"], "opened", "body was {body}");
+
+    // Dropping the client closes its connection; the server sees the EOF.
+    drop(client);
+    let mut closed = None;
+    for _ in 0..50 {
+        let (_, body) = common::http(api, "GET", "/api/v1/connections", None, None).await;
+        let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if view["active"] == 0 {
+            closed = Some(view);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let view = closed.expect("connection never recorded as closed");
+    let close = &view["events"][1];
+    assert_eq!(close["kind"], "closed", "view was {view}");
+    // A clean client disconnect: either we read its EOF first, or hyper closed
+    // the socket after its GOAWAY. Never an error, never "unresponsive".
+    let reason = close["reason"].as_str().unwrap();
+    assert!(
+        reason == "peer closed" || reason == "closed cleanly",
+        "view was {view}"
+    );
+    assert!(close["open_seconds"].is_u64(), "view was {view}");
+}

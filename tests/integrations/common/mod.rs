@@ -123,6 +123,7 @@ pub async fn start_server_with_api(
         state.deny_lists(),
         state.deny_list_store(),
         state.traffic(),
+        state.connections(),
         metrics_exporter_prometheus::PrometheusBuilder::new()
             .build_recorder()
             .handle(),
@@ -132,15 +133,19 @@ pub async fn start_server_with_api(
     );
     let (trigger, shutdown) = triggered::trigger();
 
-    let grpc_incoming = TcpListener::bind(grpc_addr).await.unwrap();
-    let grpc_stream = tokio_stream::wrappers::TcpListenerStream::new(grpc_incoming);
+    // Same listener wiring as the server binary, so connections are tracked.
+    let grpc_stream = multi_buy_service::connections::tracked_incoming(
+        TcpListener::bind(grpc_addr).await.unwrap(),
+        state.connections(),
+        None,
+    );
 
     let api_incoming = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_addr = api_incoming.local_addr().unwrap();
 
     let grpc_shutdown = shutdown.clone();
     tokio::spawn(async move {
-        tonic::transport::Server::builder()
+        multi_buy_service::tasks::grpc_server::server_builder()
             .add_service(MultiBuyServer::new(state))
             .serve_with_incoming_shutdown(grpc_stream, grpc_shutdown)
             .await

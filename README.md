@@ -235,6 +235,7 @@ token is configured. `/` and `/health` are always open.
 | `GET` | `/api/v1/info` | Version, listen addresses, uptime |
 | `GET` | `/api/v1/metrics` | Prometheus payload, rendered in-process |
 | `GET` | `/api/v1/traffic?min_gap=10` | Requests per second for the last hour, plus runs of `min_gap`+ seconds with none (e.g. HPR backing off) |
+| `GET` | `/api/v1/connections` | gRPC client connects/disconnects, with how long each was open and why it closed |
 | `GET` | `/api/v1/regions` | Every region name the proto accepts |
 | `GET` | `/api/v1/animal-name/{key}` | Animal name for an address, without changing anything |
 | `GET` | `/api/v1/deny-list` | Both deny lists |

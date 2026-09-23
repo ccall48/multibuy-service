@@ -36,6 +36,7 @@ impl Server {
                 grpc_state.deny_lists(),
                 grpc_state.deny_list_store(),
                 grpc_state.traffic(),
+                grpc_state.connections(),
                 metrics_handle,
                 settings.api.auth_token.clone(),
                 grpc_listen,

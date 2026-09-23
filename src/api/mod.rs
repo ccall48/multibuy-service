@@ -7,6 +7,7 @@
 
 pub mod settings;
 
+use crate::connections::{ConnectionEvent, Connections};
 use crate::deny_lists::{self, DenyListStore, DenyLists};
 use crate::traffic::{self, Silence, Traffic};
 use axum::{
@@ -32,6 +33,7 @@ pub struct ApiState {
     deny_lists: Arc<DenyLists>,
     store: Arc<DenyListStore>,
     traffic: Arc<Traffic>,
+    connections: Arc<Connections>,
     metrics: PrometheusHandle,
     auth_token: Option<Arc<String>>,
     grpc_listen: SocketAddr,
@@ -40,10 +42,12 @@ pub struct ApiState {
 }
 
 impl ApiState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         deny_lists: Arc<DenyLists>,
         store: Arc<DenyListStore>,
         traffic: Arc<Traffic>,
+        connections: Arc<Connections>,
         metrics: PrometheusHandle,
         auth_token: Option<String>,
         grpc_listen: SocketAddr,
@@ -53,6 +57,7 @@ impl ApiState {
             deny_lists,
             store,
             traffic,
+            connections,
             metrics,
             auth_token: auth_token.map(Arc::new),
             grpc_listen,
@@ -74,6 +79,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/v1/info", get(info))
         .route("/api/v1/metrics", get(metrics))
         .route("/api/v1/traffic", get(get_traffic))
+        .route("/api/v1/connections", get(get_connections))
         .route("/api/v1/regions", get(known_regions))
         .route("/api/v1/animal-name/{hotspot}", get(lookup_animal_name))
         .route("/api/v1/deny-list", get(get_deny_list))
@@ -271,6 +277,25 @@ async fn get_traffic(
         window_seconds: traffic::WINDOW_SECS,
         start: snapshot.start,
         counts: snapshot.counts,
+    })
+}
+
+#[derive(Serialize)]
+struct ConnectionsView {
+    /// gRPC client connections open right now.
+    active: u64,
+    /// Connections accepted since the process started.
+    opened_total: u64,
+    /// Recent opens and closes, oldest first (bounded).
+    events: Vec<ConnectionEvent>,
+}
+
+/// When gRPC clients connected and disconnected, and why they disconnected.
+async fn get_connections(State(state): State<ApiState>) -> Json<ConnectionsView> {
+    Json(ConnectionsView {
+        active: state.connections.active(),
+        opened_total: state.connections.opened_total(),
+        events: state.connections.events(),
     })
 }
 

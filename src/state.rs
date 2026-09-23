@@ -1,4 +1,5 @@
 use crate::cache::Cache;
+use crate::connections::Connections;
 use crate::deny_lists::{DenyListStore, DenyLists};
 use crate::settings::Settings;
 use crate::traffic::Traffic;
@@ -11,6 +12,7 @@ pub struct State {
     deny_lists: Arc<DenyLists>,
     store: Arc<DenyListStore>,
     traffic: Arc<Traffic>,
+    connections: Arc<Connections>,
 }
 
 impl State {
@@ -65,6 +67,7 @@ impl State {
             deny_lists: Arc::new(deny_lists),
             store: Arc::new(store),
             traffic: Arc::new(Traffic::new()),
+            connections: Arc::new(Connections::new()),
         })
     }
 
@@ -87,6 +90,12 @@ impl State {
     /// can show when requests stopped arriving.
     pub fn traffic(&self) -> Arc<Traffic> {
         self.traffic.clone()
+    }
+
+    /// Open/close history of gRPC client connections, shared with the admin
+    /// API so reconnects can be lined up against traffic silences.
+    pub fn connections(&self) -> Arc<Connections> {
+        self.connections.clone()
     }
 }
 
