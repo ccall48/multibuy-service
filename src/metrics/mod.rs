@@ -75,7 +75,7 @@ pub fn inc_cache_size() {
 }
 
 pub fn record_request_duration(duration: std::time::Duration) {
-    metrics::histogram!(REQUEST_DURATION).record(duration.as_millis() as f64);
+    metrics::histogram!(REQUEST_DURATION).record(duration.as_secs_f64() * 1000.0);
 }
 
 /// Track the size of a deny list so changes made through the admin API show up
