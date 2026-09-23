@@ -25,6 +25,11 @@ pub struct Settings {
     pub api: crate::api::Settings,
     #[serde(default = "default_cleanup_timeout", with = "humantime_serde")]
     pub cleanup_timeout: Duration,
+    /// How long the LNS waits to merge copies of one uplink (ChirpStack's
+    /// `deduplication_delay`). Copies arriving here later than this after the
+    /// first are flagged as late on the dashboard.
+    #[serde(default = "default_lns_dedup_window", with = "humantime_serde")]
+    pub lns_dedup_window: Duration,
     /// Base58-encoded hotspot public keys to deny
     #[serde(default)]
     pub denied_hotspots: Vec<String>,
@@ -50,6 +55,10 @@ pub fn default_grpc_listen_addr() -> SocketAddr {
 
 pub fn default_deny_list_store() -> PathBuf {
     PathBuf::from("deny-list.json")
+}
+
+pub fn default_lns_dedup_window() -> Duration {
+    Duration::from_millis(200)
 }
 
 pub fn default_cleanup_timeout() -> Duration {

@@ -252,6 +252,12 @@ struct TrafficView {
     start: u64,
     counts: Vec<u32>,
     total: u64,
+    /// Copies that arrived after the LNS dedup window, as `[second, count]`.
+    late: Vec<(u64, u32)>,
+    /// The same packet again after `repeat_after_ms`, as `[second, count]`.
+    repeats: Vec<(u64, u32)>,
+    dedup_window_ms: u64,
+    repeat_after_ms: u64,
     /// Unix second of the most recent request in the window, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     last_request: Option<u64>,
@@ -267,9 +273,16 @@ async fn get_traffic(
     State(state): State<ApiState>,
     Query(query): Query<TrafficQuery>,
 ) -> Json<TrafficView> {
-    let snapshot = state.traffic.snapshot();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let snapshot = state.traffic.requests.snapshot_at(now);
     let min_gap = query.min_gap.max(1);
     Json(TrafficView {
+        late: state.traffic.late.snapshot_at(now).nonzero(),
+        repeats: state.traffic.repeats.snapshot_at(now).nonzero(),
+        dedup_window_ms: state.traffic.dedup_window.as_millis() as u64,
+        repeat_after_ms: traffic::REPEAT_AFTER.as_millis() as u64,
         total: snapshot.total(),
         last_request: snapshot.last_request(),
         silences: snapshot.silences(min_gap),

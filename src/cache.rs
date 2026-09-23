@@ -20,12 +20,14 @@ impl Cache {
         }
     }
 
-    pub fn inc(&self, key: String) -> u32 {
+    /// Count one request for `key`. Returns the new count and, for every
+    /// request after the first, how long ago the first one arrived.
+    pub fn inc(&self, key: String) -> (u32, Option<std::time::Duration>) {
         match self.map.entry(key) {
             Entry::Occupied(mut entry) => {
                 let val = entry.get_mut();
                 val.count += 1;
-                val.count
+                (val.count, Some(val.created_at.elapsed()))
             }
             Entry::Vacant(entry) => {
                 entry.insert(CacheValue {
@@ -33,7 +35,7 @@ impl Cache {
                     created_at: Instant::now(),
                 });
                 crate::metrics::inc_cache_size();
-                1
+                (1, None)
             }
         }
     }

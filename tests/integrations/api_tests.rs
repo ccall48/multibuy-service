@@ -618,3 +618,36 @@ async fn connections_endpoint_records_open_and_close() {
     );
     assert!(close["open_seconds"].is_u64(), "view was {view}");
 }
+
+#[tokio::test]
+async fn traffic_endpoint_flags_copies_after_the_dedup_window() {
+    let mut settings = common::test_settings();
+    settings.lns_dedup_window = std::time::Duration::from_millis(50);
+    let grpc_addr = common::available_port().await;
+    let (_shutdown, api) = common::start_server_with_api(&settings, grpc_addr).await;
+    let mut client = common::connect_client(grpc_addr).await;
+
+    // Two copies inside the window, then one after it.
+    common::inc(&mut client, "pkt", vec![], Region::Us915 as i32).await;
+    common::inc(&mut client, "pkt", vec![], Region::Us915 as i32).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    common::inc(&mut client, "pkt", vec![], Region::Us915 as i32).await;
+
+    let (status, body) = common::http(api, "GET", "/api/v1/traffic", None, None).await;
+    assert_eq!(status, 200, "body was {body}");
+    let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(view["total"], 3, "body was {body}");
+    assert_eq!(view["dedup_window_ms"], 50);
+    assert_eq!(view["repeat_after_ms"], 3000);
+    let late: u64 = view["late"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|pair| pair[1].as_u64().unwrap())
+        .sum();
+    assert_eq!(late, 1, "body was {body}");
+    assert!(
+        view["repeats"].as_array().unwrap().is_empty(),
+        "body was {body}"
+    );
+}

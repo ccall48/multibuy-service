@@ -8,6 +8,7 @@ const HIT_TOTAL: &str = "multi_buy_hit_total";
 const DENIED_TOTAL: &str = "multi_buy_denied_total";
 const CACHE_SIZE: &str = "multi_buy_cache_size";
 const REQUEST_DURATION: &str = "multi_buy_request_duration_ms";
+const COPY_DELAY: &str = "multi_buy_copy_delay_ms";
 const DENY_LIST_SIZE: &str = "multi_buy_deny_list_size";
 const DENIED_BY_REASON: &str = "multi_buy_denied_by_reason_total";
 const DENIED_BY_REGION: &str = "multi_buy_denied_by_region_total";
@@ -76,6 +77,13 @@ pub fn inc_cache_size() {
 
 pub fn record_request_duration(duration: std::time::Duration) {
     metrics::histogram!(REQUEST_DURATION).record(duration.as_secs_f64() * 1000.0);
+}
+
+/// How long after the first copy of a packet a later copy arrived. Only
+/// recorded for copies within the repeat threshold, so device resends minutes
+/// later don't swamp the distribution.
+pub fn record_copy_delay(delay: std::time::Duration) {
+    metrics::histogram!(COPY_DELAY).record(delay.as_secs_f64() * 1000.0);
 }
 
 /// Track the size of a deny list so changes made through the admin API show up

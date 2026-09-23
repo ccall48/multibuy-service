@@ -66,7 +66,7 @@ impl State {
             cache: Arc::new(Cache::new()),
             deny_lists: Arc::new(deny_lists),
             store: Arc::new(store),
-            traffic: Arc::new(Traffic::new()),
+            traffic: Arc::new(Traffic::new(settings.lns_dedup_window)),
             connections: Arc::new(Connections::new()),
         })
     }
@@ -107,14 +107,14 @@ impl multi_buy_server::MultiBuy for State {
     ) -> Result<tonic::Response<MultiBuyIncResV1>, tonic::Status> {
         let start = std::time::Instant::now();
         crate::metrics::increment_hit();
-        self.traffic.record();
 
         let multi_buy_req = request.into_inner();
         // Records a hit against each entry that matched, so the admin API can
         // report which rules are actually doing work.
         let matched = self.deny_lists.check(&multi_buy_req);
         let denied = matched.is_denied();
-        let count = self.cache.inc(multi_buy_req.key.clone());
+        let (count, since_first) = self.cache.inc(multi_buy_req.key.clone());
+        self.traffic.record(since_first);
         let hotspot = String::from_utf8_lossy(&multi_buy_req.hotspot_key).into_owned();
         // The proto region is an integer; log the name so a denial is readable
         // without a lookup table.

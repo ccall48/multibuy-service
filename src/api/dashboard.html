@@ -16,13 +16,14 @@
     --ok: #3ddc97;
     --warn: #ffb454;
     --bad: #ff6b6b;
+    --late: #e0569f;
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
   @media (prefers-color-scheme: light) {
     :root {
       --bg: #f6f7f9; --panel: #fff; --panel-2: #f0f2f5; --border: #dfe3ea;
       --text: #1a1d24; --muted: #6b7280; --accent: #2563eb;
-      --ok: #16a34a; --warn: #d97706; --bad: #dc2626;
+      --ok: #16a34a; --warn: #d97706; --bad: #dc2626; --late: #a21caf;
     }
   }
   * { box-sizing: border-box; }
@@ -103,7 +104,10 @@
   .toast div.ok { border-left-color: var(--ok); }
   .toast div small { display: block; color: var(--muted); font-family: var(--mono); font-size: 11px; margin-top: 3px; }
   .traffic .body { position: relative; }
-  .traffic svg.chart { display: block; width: 100%; height: 160px; overflow: visible; }
+  .traffic svg.chart { display: block; width: 100%; height: auto; overflow: visible; }
+  .traffic rect.late { fill: var(--late); }
+  .traffic .strip-label { fill: var(--muted); font-size: 11px; paint-order: stroke;
+                          stroke: var(--panel); stroke-width: 3px; stroke-linejoin: round; }
   .traffic .axis text { fill: var(--muted); font-size: 11px; font-family: var(--mono); }
   .traffic .axis line { stroke: var(--border); }
   .traffic rect.bar { fill: var(--accent); }
@@ -166,7 +170,8 @@
       <div class="legend"><span><i style="background:var(--accent)"></i>requests per bar</span>
         <span><i style="background:var(--warn);opacity:.5"></i>silence (no requests arrived)</span>
         <span><i style="background:var(--ok);width:3px"></i>HPR connected</span>
-        <span><i style="background:var(--bad);width:3px"></i>HPR disconnected</span></div>
+        <span><i style="background:var(--bad);width:3px"></i>HPR disconnected</span>
+        <span id="late-legend"><i style="background:var(--late)"></i>late copies &amp; repeats (rows below chart)</span></div>
       <div id="traffic-chart"></div>
       <div class="tip" id="traffic-tip"></div>
       <table id="silence-table"><tbody></tbody></table>
@@ -174,7 +179,11 @@
       <table id="conn-table"><tbody></tbody></table>
       <div class="hint">HPR stops calling this service for a route while it backs off after a failed request
         (1s, doubling to 5 min). With <code>fail_on_unavailable</code> on, it drops those packets, so they
-        appear here as silences in otherwise steady traffic.</div>
+        appear here as silences in otherwise steady traffic.<br>
+        HPR also waits for this service before forwarding each copy to your LNS. A <b>late copy</b> reached
+        us more than the LNS dedup window (<code>lns_dedup_window</code>) after the first copy of the same packet,
+        so the LNS likely logged it as a retransmission. A <b>repeat</b> is the same packet 3s or more later:
+        a device resending an unacknowledged frame, or a copy stuck behind a failed call.</div>
     </div>
   </section>
 
@@ -579,7 +588,10 @@ function renderTraffic() {
   const from = end - span + 1;                        // chart spans the chosen range
   const host = $("traffic-chart");
   const width = Math.max(280, host.clientWidth || 800);
-  const height = 160, top = 8, bottom = 22, plotH = height - top - bottom;
+  // Main plot, then two strip rows (late copies, repeats) on the same time axis.
+  const top = 8, plotH = 130, stripH = 18, stripGap = 6, bottom = 22;
+  const stripY = [top + plotH + 8, top + plotH + 8 + stripH + stripGap];
+  const height = stripY[1] + stripH + bottom;
 
   // Coarsen buckets on narrow screens so each bar keeps a few pixels.
   const bucket = [1, 2, 5, 10, 15, 20, 30, 60, 120].find((b) => (span / b) * 5 <= width) || 120;
@@ -590,6 +602,13 @@ function renderTraffic() {
     if (second >= from) sums[Math.floor((second - from) / bucket)] += c;
   });
   const max = Math.max(1, ...sums);
+  const bucketed = (pairs) => {
+    const out = new Array(n).fill(0);
+    for (const [second, c] of pairs || []) if (second >= from) out[Math.floor((second - from) / bucket)] += c;
+    return out;
+  };
+  const lateSums = bucketed(t.late), repeatSums = bucketed(t.repeats);
+  const lateTotal = lateSums.reduce((a, b) => a + b, 0), repeatTotal = repeatSums.reduce((a, b) => a + b, 0);
   const x = (second) => (Math.max(0, second - from) / span) * width;
   const pitch = width / n, barW = Math.max(1, pitch - 2);
 
@@ -609,6 +628,22 @@ function renderTraffic() {
     const h = Math.max(2, (v / max) * plotH);
     svg += '<rect class="bar" data-i="' + i + '" x="' + (i * pitch + 1) + '" y="' + (top + plotH - h) +
       '" width="' + barW + '" height="' + h + '" rx="' + Math.min(2, barW / 2) + '"/>';
+  });
+
+  // Strip rows: each scaled to its own peak, since they're a small slice of
+  // all requests and would vanish on the main scale.
+  [[lateSums, "late copies > " + t.dedup_window_ms + "ms", lateTotal],
+   [repeatSums, "repeats ≥ " + t.repeat_after_ms / 1000 + "s", repeatTotal]].forEach(([vals, label, total], row) => {
+    const y0 = stripY[row], rowMax = Math.max(1, ...vals);
+    svg += '<line x1="0" x2="' + width + '" y1="' + (y0 + stripH) + '" y2="' + (y0 + stripH) +
+      '" stroke="var(--border)"/>';
+    vals.forEach((v, i) => {
+      if (!v) return;
+      const h = Math.max(2, (v / rowMax) * stripH);
+      svg += '<rect class="late" x="' + (i * pitch + 1) + '" y="' + (y0 + stripH - h) + '" width="' + barW +
+        '" height="' + h + '" rx="' + Math.min(1.5, barW / 2) + '"/>';
+    });
+    svg += '<text class="strip-label" x="0" y="' + (y0 + 11) + '">' + label + ' · ' + fmt(total) + '</text>';
   });
 
   // Connection opens/closes as thin full-height rules with a cap, drawn over
@@ -656,9 +691,9 @@ function renderTraffic() {
       "<small>" + clock(b0) + " – " + clock(b0 + bucket - 1) + "</small>" +
       (silence ? '<small style="color:var(--warn)">silent ' + durationText(silence.seconds) +
         " from " + clock(silence.start) + (silence.ongoing ? " (ongoing)" : "") + "</small>" : "") +
-      events.filter((ev) => ev.at >= b0 && ev.at < b0 + bucket).map((ev) =>
-        '<small style="color:var(--' + (ev.kind === "opened" ? "ok" : "bad") + ')">' + clock(ev.at) + " " +
-        connText(ev) + "</small>").join("");
+      (lateSums[i] || repeatSums[i] ? '<small style="color:var(--late)">' + fmt(lateSums[i]) + " late · " +
+        fmt(repeatSums[i]) + " repeat" + (repeatSums[i] === 1 ? "" : "s") + "</small>" : "") +
+      tipEvents(events.filter((ev) => ev.at >= b0 && ev.at < b0 + bucket));
     tip.style.display = "block";
     const hostRect = host.parentElement.getBoundingClientRect();
     const left = e.clientX - hostRect.left + 12;
@@ -676,7 +711,9 @@ function renderTraffic() {
   $("traffic-summary").textContent = fmt(t.total) + " in window · " + last + " · " +
     t.silences.length + " silence" + (t.silences.length === 1 ? "" : "s") + " ≥ " + t.min_gap + "s" +
     (conns ? " · " + conns.active + " connection" + (conns.active === 1 ? "" : "s") + " open · " +
-      reconnects + " connect" + (reconnects === 1 ? "" : "s") + " in view" : "");
+      reconnects + " connect" + (reconnects === 1 ? "" : "s") + " in view" : "") +
+    " · " + fmt(lateTotal) + " late cop" + (lateTotal === 1 ? "y" : "ies") + " · " +
+    fmt(repeatTotal) + " repeat" + (repeatTotal === 1 ? "" : "s");
   renderConnections();
   const rows = t.silences.slice().reverse().map((g) =>
     "<tr><td>" + clock(g.start) + "</td><td class=\"num\">" + durationText(g.seconds) + "</td><td>" +
@@ -684,6 +721,15 @@ function renderTraffic() {
   $("silence-table").querySelector("tbody").innerHTML = rows.length
     ? "<tr><th>Silent from</th><th style=\"text-align:right\">For</th><th>Traffic resumed</th></tr>" + rows.join("")
     : '<tr><td class="empty">No silences of ' + t.min_gap + "s or longer since traffic began.</td></tr>";
+}
+
+// Connection events for the tooltip, capped so a burst of reconnects doesn't
+// produce a wall of text; the full list is in the table below.
+function tipEvents(list) {
+  const shown = list.slice(0, 3).map((ev) =>
+    '<small style="color:var(--' + (ev.kind === "opened" ? "ok" : "bad") + ')">' + clock(ev.at) + " " +
+    connText(ev) + "</small>").join("");
+  return shown + (list.length > 3 ? "<small>+" + (list.length - 3) + " more connection events</small>" : "");
 }
 
 function connText(ev) {

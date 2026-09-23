@@ -117,6 +117,11 @@ listen = "0.0.0.0:6081"
 # Cache cleanup interval (humantime format)
 # Env: MB__CLEANUP_TIMEOUT
 # cleanup_timeout = "30 minutes"
+
+# Your LNS's dedup window (ChirpStack: deduplication_delay). Copies arriving
+# later than this after the first are flagged as late on the dashboard.
+# Env: MB__LNS_DEDUP_WINDOW
+# lns_dedup_window = "200ms"
 ```
 
 ### Environment Variables
@@ -127,6 +132,7 @@ listen = "0.0.0.0:6081"
 | `MB__GRPC_LISTEN` | gRPC listen address | `0.0.0.0:6080` |
 | `MB__METRICS__ENDPOINT` | Prometheus metrics listen address | `0.0.0.0:19011` |
 | `MB__CLEANUP_TIMEOUT` | Cache cleanup interval | `30 minutes` |
+| `MB__LNS_DEDUP_WINDOW` | LNS dedup window; later copies are flagged as late | `200ms` |
 | `MB__DENIED_HOTSPOTS` | Base58-encoded hotspot public keys to deny | `[]` |
 | `MB__DENIED_REGIONS` | Region names to deny (e.g., US915, EU868) | `[]` |
 | `MB__API__ENABLED` | Run the admin API and dashboard | `true` |
@@ -142,6 +148,7 @@ listen = "0.0.0.0:6081"
 | `multi_buy_denied_total` | Counter | Total requests denied by deny lists |
 | `multi_buy_cache_size` | Gauge | Number of entries in the cache |
 | `multi_buy_cache_cleaned_total` | Counter | Total entries removed by cache cleanup |
+| `multi_buy_copy_delay_ms` | Histogram | How long after a packet's first copy each later copy arrived (under 3s) |
 | `multi_buy_deny_list_size` | Gauge | Deny list entries, labelled `kind="hotspots"\|"regions"` |
 | `multi_buy_denied_by_reason_total` | Counter | Denials by matching rule, labelled `reason="hotspot"\|"region"\|"both"` |
 | `multi_buy_denied_by_region_total` | Counter | Denials attributed to a region, labelled `region="EU868"` etc. |
@@ -234,7 +241,7 @@ token is configured. `/` and `/health` are always open.
 | `GET` | `/health` | Liveness check |
 | `GET` | `/api/v1/info` | Version, listen addresses, uptime |
 | `GET` | `/api/v1/metrics` | Prometheus payload, rendered in-process |
-| `GET` | `/api/v1/traffic?min_gap=10` | Requests per second for the last hour, plus runs of `min_gap`+ seconds with none (e.g. HPR backing off) |
+| `GET` | `/api/v1/traffic?min_gap=10` | Requests per second for the last hour, runs of `min_gap`+ seconds with none (e.g. HPR backing off), and copies arriving after the LNS dedup window or as repeats |
 | `GET` | `/api/v1/connections` | gRPC client connects/disconnects, with how long each was open and why it closed |
 | `GET` | `/api/v1/regions` | Every region name the proto accepts |
 | `GET` | `/api/v1/animal-name/{key}` | Animal name for an address, without changing anything |

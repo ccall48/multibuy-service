@@ -1,4 +1,5 @@
-//! Per-second request counts for the last hour, and the silences in them.
+//! Per-second request counts for the last hour, the silences in them, and
+//! copies of a packet that arrived late.
 //!
 //! HPR stops calling a custom multibuy service entirely while it is backing off
 //! after a failed request (1s doubling to 5 minutes), and with
@@ -7,10 +8,17 @@
 //! stretch of seconds with no requests in otherwise steady traffic. Keeping the
 //! history server-side means the gaps are visible after the fact, without a
 //! Prometheus server or a dashboard tab left open.
+//!
+//! HPR also waits for this service's answer before forwarding each copy of an
+//! uplink to the LNS. Copies that reach us well after the first of the same
+//! packet will reach the LNS late too; past its dedup window they show up there
+//! as a second uplink with the same frame count. Those are counted here as
+//! "late" (after the dedup window) or "repeats" (seconds later: a device
+//! resending an unacknowledged frame, or a copy stalled behind a failed call).
 
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// How many seconds of history are kept.
 pub const WINDOW_SECS: u64 = 3600;
@@ -22,7 +30,7 @@ pub const WINDOW_SECS: u64 = 3600;
 /// lap of the ring is recognisable (its second is stale) and reads as zero.
 /// Recording is one CAS on the request path; there is no lock and no
 /// background task.
-pub struct Traffic {
+pub struct PerSecond {
     slots: Box<[AtomicU64]>,
     /// Unix seconds when recording began. Earlier seconds are unknown, not
     /// silent, so they are never reported.
@@ -54,19 +62,89 @@ fn unpack(slot: u64) -> (u64, u32) {
     (slot >> 32, slot as u32)
 }
 
+/// Copies arriving this long or longer after the first are counted as repeats,
+/// not late copies. A LoRaWAN device resends an unacknowledged confirmed uplink
+/// only after its receive windows and ACK timeout, at least ~3s later; HPR's own
+/// copies normally land well inside that.
+pub const REPEAT_AFTER: Duration = Duration::from_secs(3);
+
+/// How one request relates to earlier requests for the same packet key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arrival {
+    /// The first copy of this packet.
+    First,
+    /// A later copy, inside the LNS dedup window.
+    OnTime,
+    /// A later copy, after the dedup window: the LNS will likely see it as a
+    /// separate uplink with a repeated frame count.
+    Late,
+    /// The same packet seconds later: a device resend or a stalled copy.
+    Repeat,
+}
+
+impl Arrival {
+    /// Classify a request by how long after the first copy it arrived
+    /// (`None` for the first copy itself).
+    pub fn classify(since_first: Option<Duration>, dedup_window: Duration) -> Self {
+        match since_first {
+            None => Self::First,
+            Some(d) if d >= REPEAT_AFTER => Self::Repeat,
+            Some(d) if d > dedup_window => Self::Late,
+            Some(_) => Self::OnTime,
+        }
+    }
+}
+
+/// Per-second history of all requests, plus the late copies and repeats among
+/// them.
+pub struct Traffic {
+    pub requests: PerSecond,
+    pub late: PerSecond,
+    pub repeats: PerSecond,
+    pub dedup_window: Duration,
+}
+
+impl Traffic {
+    pub fn new(dedup_window: Duration) -> Self {
+        Self {
+            requests: PerSecond::new(),
+            late: PerSecond::new(),
+            repeats: PerSecond::new(),
+            dedup_window,
+        }
+    }
+
+    /// Record one request, given how long after its packet's first copy it
+    /// arrived (`None` if it is the first).
+    pub fn record(&self, since_first: Option<Duration>) -> Arrival {
+        let second = now_unix();
+        self.requests.record_at(second);
+        let arrival = Arrival::classify(since_first, self.dedup_window);
+        match arrival {
+            Arrival::Late => self.late.record_at(second),
+            Arrival::Repeat => self.repeats.record_at(second),
+            Arrival::First | Arrival::OnTime => {}
+        }
+        if let (Some(delay), Arrival::OnTime | Arrival::Late) = (since_first, arrival) {
+            crate::metrics::record_copy_delay(delay);
+        }
+        arrival
+    }
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
 }
 
-impl Default for Traffic {
+impl Default for PerSecond {
     fn default() -> Self {
         Self::starting_at(now_unix())
     }
 }
 
-impl Traffic {
+impl PerSecond {
     pub fn new() -> Self {
         Self::default()
     }
@@ -139,6 +217,17 @@ impl Snapshot {
             .map(|last| self.start + last)
     }
 
+    /// Only the seconds with a non-zero count, as `(second, count)` — compact
+    /// for sparse series like late copies.
+    pub fn nonzero(&self) -> Vec<(u64, u32)> {
+        self.counts
+            .iter()
+            .enumerate()
+            .filter(|(_, &c)| c > 0)
+            .map(|(i, &c)| (self.start + i as u64, c))
+            .collect()
+    }
+
     pub fn total(&self) -> u64 {
         self.counts.iter().map(|&c| u64::from(c)).sum()
     }
@@ -202,12 +291,34 @@ mod tests {
 
     const T0: u64 = 1_800_000_000;
 
-    fn recorded(seconds: &[u64]) -> Traffic {
-        let traffic = Traffic::starting_at(T0);
+    fn recorded(seconds: &[u64]) -> PerSecond {
+        let traffic = PerSecond::starting_at(T0);
         for &s in seconds {
             traffic.record_at(s);
         }
         traffic
+    }
+
+    #[test]
+    fn arrivals_are_classified_by_delay_after_first_copy() {
+        let window = Duration::from_millis(200);
+        let at = |ms| Arrival::classify(Some(Duration::from_millis(ms)), window);
+        assert_eq!(Arrival::classify(None, window), Arrival::First);
+        assert_eq!(at(0), Arrival::OnTime);
+        assert_eq!(at(200), Arrival::OnTime);
+        assert_eq!(at(201), Arrival::Late);
+        assert_eq!(at(2_999), Arrival::Late);
+        assert_eq!(at(3_000), Arrival::Repeat);
+        assert_eq!(at(600_000), Arrival::Repeat);
+    }
+
+    #[test]
+    fn nonzero_lists_only_busy_seconds() {
+        let traffic = recorded(&[T0, T0 + 2, T0 + 2]);
+        assert_eq!(
+            traffic.snapshot_at(T0 + 3).nonzero(),
+            vec![(T0, 1), (T0 + 2, 2)]
+        );
     }
 
     #[test]
@@ -283,7 +394,7 @@ mod tests {
 
     #[test]
     fn concurrent_records_are_all_counted() {
-        let traffic = std::sync::Arc::new(Traffic::starting_at(T0));
+        let traffic = std::sync::Arc::new(PerSecond::starting_at(T0));
         let handles: Vec<_> = (0..8)
             .map(|_| {
                 let traffic = traffic.clone();

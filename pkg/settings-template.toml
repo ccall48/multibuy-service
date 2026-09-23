@@ -10,6 +10,11 @@ grpc_listen = "0.0.0.0:6080"
 # Env: MB__DENIED_HOTSPOTS
 # denied_hotspots = []
 
+# Your LNS's dedup window (ChirpStack: deduplication_delay). Copies of a packet
+# arriving later than this after the first are flagged as late on the dashboard.
+# Env: MB__LNS_DEDUP_WINDOW
+# lns_dedup_window = "200ms"
+
 # Region names to deny (e.g., "US915", "EU868")
 # Env: MB__DENIED_REGIONS
 # denied_regions = []
