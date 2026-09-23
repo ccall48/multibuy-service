@@ -1,6 +1,7 @@
 use crate::cache::Cache;
 use crate::deny_lists::{DenyListStore, DenyLists};
 use crate::settings::Settings;
+use crate::traffic::Traffic;
 use helium_proto::services::multi_buy::{multi_buy_server, MultiBuyIncReqV1, MultiBuyIncResV1};
 use std::sync::Arc;
 use tonic::Request;
@@ -9,6 +10,7 @@ pub struct State {
     cache: Arc<Cache>,
     deny_lists: Arc<DenyLists>,
     store: Arc<DenyListStore>,
+    traffic: Arc<Traffic>,
 }
 
 impl State {
@@ -62,6 +64,7 @@ impl State {
             cache: Arc::new(Cache::new()),
             deny_lists: Arc::new(deny_lists),
             store: Arc::new(store),
+            traffic: Arc::new(Traffic::new()),
         })
     }
 
@@ -79,6 +82,12 @@ impl State {
     pub fn deny_list_store(&self) -> Arc<DenyListStore> {
         self.store.clone()
     }
+
+    /// Per-second request history. Shared with the admin API so the dashboard
+    /// can show when requests stopped arriving.
+    pub fn traffic(&self) -> Arc<Traffic> {
+        self.traffic.clone()
+    }
 }
 
 #[tonic::async_trait]
@@ -89,6 +98,7 @@ impl multi_buy_server::MultiBuy for State {
     ) -> Result<tonic::Response<MultiBuyIncResV1>, tonic::Status> {
         let start = std::time::Instant::now();
         crate::metrics::increment_hit();
+        self.traffic.record();
 
         let multi_buy_req = request.into_inner();
         // Records a hit against each entry that matched, so the admin API can

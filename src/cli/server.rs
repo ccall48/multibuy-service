@@ -35,6 +35,7 @@ impl Server {
             let api_state = ApiState::new(
                 grpc_state.deny_lists(),
                 grpc_state.deny_list_store(),
+                grpc_state.traffic(),
                 metrics_handle,
                 settings.api.auth_token.clone(),
                 grpc_listen,

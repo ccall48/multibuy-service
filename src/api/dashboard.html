@@ -102,6 +102,25 @@
   .toast div.err { border-left-color: var(--bad); }
   .toast div.ok { border-left-color: var(--ok); }
   .toast div small { display: block; color: var(--muted); font-family: var(--mono); font-size: 11px; margin-top: 3px; }
+  .traffic .body { position: relative; }
+  .traffic svg.chart { display: block; width: 100%; height: 160px; overflow: visible; }
+  .traffic .axis text { fill: var(--muted); font-size: 11px; font-family: var(--mono); }
+  .traffic .axis line { stroke: var(--border); }
+  .traffic rect.bar { fill: var(--accent); }
+  .traffic rect.bar.hover { filter: brightness(1.25); }
+  .traffic rect.silence { fill: var(--warn); opacity: .22; }
+  .traffic rect.silence-edge { fill: var(--warn); }
+  .traffic .legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+  .traffic .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+  .traffic .tip { position: absolute; pointer-events: none; background: var(--panel-2); border: 1px solid var(--border);
+                  border-radius: 7px; padding: 6px 9px; font-size: 12px; white-space: nowrap; display: none;
+                  box-shadow: 0 6px 18px rgba(0,0,0,.2); z-index: 2; }
+  .traffic .tip b { font-variant-numeric: tabular-nums; }
+  .traffic .tip small { display: block; color: var(--muted); font-family: var(--mono); font-size: 11px; }
+  .traffic select { flex: 0 0 auto; padding: 3px 8px; font-size: 12px; }
+  .traffic table { margin-top: 12px; }
+  .traffic .hint { font-size: 12px; color: var(--muted); margin-top: 10px; }
+  .badge { font-size: 11px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--warn); color: var(--warn); }
   details.raw { margin-top: 28px; }
   details.raw summary { cursor: pointer; color: var(--muted); font-size: 13px; }
   details.raw pre { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
@@ -123,6 +142,32 @@
 <main>
   <h2>Metrics</h2>
   <div class="cards" id="cards"></div>
+
+  <h2>Traffic <span style="text-transform:none;letter-spacing:0;font-weight:400">— last hour, kept by the service</span></h2>
+  <section class="panel traffic">
+    <div class="head" style="flex-wrap:wrap"><strong>Requests</strong>
+      <span class="spacer" style="flex:1"></span>
+      <label class="count" for="range-select">show</label>
+      <select id="range-select">
+        <option value="300">5 min</option><option value="900">15 min</option><option value="3600">1 hour</option>
+      </select>
+      <label class="count" for="gap-select">silence ≥</label>
+      <select id="gap-select">
+        <option value="5">5s</option><option value="10">10s</option>
+        <option value="30">30s</option><option value="60">60s</option>
+      </select></div>
+    <div class="body">
+      <div class="note" id="traffic-summary" style="margin:0 0 8px">–</div>
+      <div class="legend"><span><i style="background:var(--accent)"></i>requests per bar</span>
+        <span><i style="background:var(--warn);opacity:.5"></i>silence (no requests arrived)</span></div>
+      <div id="traffic-chart"></div>
+      <div class="tip" id="traffic-tip"></div>
+      <table id="silence-table"><tbody></tbody></table>
+      <div class="hint">HPR stops calling this service for a route while it backs off after a failed request
+        (1s, doubling to 5 min). With <code>fail_on_unavailable</code> on, it drops those packets, so they
+        appear here as silences in otherwise steady traffic.</div>
+    </div>
+  </section>
 
   <h2>Deny lists <span style="text-transform:none;letter-spacing:0;font-weight:400">— changes apply to the next request, no restart</span></h2>
   <div class="note" id="persist-note"></div>
@@ -490,6 +535,142 @@ async function loadRegionOptions() {
     .map((r) => "<option>" + r + "</option>").join("");
 }
 
+// ------------------------------------------------------------ traffic
+
+const GAP_KEY = "mb_min_gap";
+let minGap = 10;
+try { minGap = parseInt(localStorage.getItem(GAP_KEY), 10) || 10; } catch (_) {}
+let traffic = null;
+const RANGE_KEY = "mb_traffic_range";
+let range = 900;
+try { range = parseInt(localStorage.getItem(RANGE_KEY), 10) || 900; } catch (_) {}
+
+const clock = (unix) => new Date(unix * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+
+function durationText(seconds) {
+  if (seconds < 60) return seconds + "s";
+  const m = Math.floor(seconds / 60), s = seconds % 60;
+  return m + "m" + (s ? " " + s + "s" : "");
+}
+
+async function loadTraffic() {
+  traffic = await apiJson("/api/v1/traffic?min_gap=" + minGap);
+  renderTraffic();
+}
+
+function renderTraffic() {
+  if (!traffic) return;
+  const t = traffic;
+  const end = t.start + t.counts.length - 1;          // latest second, inclusive
+  const span = Math.min(range, t.window_seconds);
+  const from = end - span + 1;                        // chart spans the chosen range
+  const host = $("traffic-chart");
+  const width = Math.max(280, host.clientWidth || 800);
+  const height = 160, top = 8, bottom = 22, plotH = height - top - bottom;
+
+  // Coarsen buckets on narrow screens so each bar keeps a few pixels.
+  const bucket = [1, 2, 5, 10, 15, 20, 30, 60, 120].find((b) => (span / b) * 5 <= width) || 120;
+  const n = Math.ceil(span / bucket);
+  const sums = new Array(n).fill(0);
+  t.counts.forEach((c, i) => {
+    const second = t.start + i;
+    if (second >= from) sums[Math.floor((second - from) / bucket)] += c;
+  });
+  const max = Math.max(1, ...sums);
+  const x = (second) => (Math.max(0, second - from) / span) * width;
+  const pitch = width / n, barW = Math.max(1, pitch - 2);
+
+  let svg = '<svg class="chart" viewBox="0 0 ' + width + ' ' + height + '" role="img" aria-label="Requests per ' +
+    bucket + ' seconds over the last ' + durationText(span) + '">';
+
+  // Silences first, so bars sit on top of the shading.
+  for (const g of t.silences) {
+    if (g.start + g.seconds <= from) continue;
+    const x0 = x(g.start), w = Math.max(2, x(g.start + g.seconds) - x0);
+    svg += '<rect class="silence" x="' + x0 + '" y="' + top + '" width="' + w + '" height="' + plotH + '"/>' +
+      '<rect class="silence-edge" x="' + x0 + '" y="' + top + '" width="' + w + '" height="2"/>';
+  }
+
+  sums.forEach((v, i) => {
+    if (!v) return;
+    const h = Math.max(2, (v / max) * plotH);
+    svg += '<rect class="bar" data-i="' + i + '" x="' + (i * pitch + 1) + '" y="' + (top + plotH - h) +
+      '" width="' + barW + '" height="' + h + '" rx="' + Math.min(2, barW / 2) + '"/>';
+  });
+
+  // Recessive axis: baseline, a tick every 15 minutes, the peak value.
+  svg += '<g class="axis"><line x1="0" x2="' + width + '" y1="' + (top + plotH) + '" y2="' + (top + plotH) + '"/>';
+  for (let k = 4; k >= 0; k--) {
+    const ago = (span / 4) * k;
+    const px = width - (ago / span) * width;
+    const anchor = k === 4 ? "start" : k === 0 ? "end" : "middle";
+    svg += '<text x="' + px + '" y="' + (height - 4) + '" text-anchor="' + anchor + '">' +
+      (k ? "−" + durationText(ago) : "now") + '</text>';
+  }
+  svg += '<text x="0" y="' + (top + 10) + '">' + fmt(max) + ' / ' + bucket + 's</text>';
+  if (t.start > from) {
+    const px = x(t.start);
+    svg += '<line x1="' + px + '" x2="' + px + '" y1="' + top + '" y2="' + (top + plotH) + '" stroke-dasharray="3 3"/>' +
+      '<text x="' + (px - 4) + '" y="' + (top + 22) + '" text-anchor="end">started</text>';
+  }
+  svg += '</g></svg>';
+  host.innerHTML = svg;
+
+  // Hover: whole-column hit targets, not just the (often thin) bars.
+  const chart = host.querySelector("svg");
+  const tip = $("traffic-tip");
+  chart.addEventListener("mousemove", (e) => {
+    const rect = chart.getBoundingClientRect();
+    const px = ((e.clientX - rect.left) / rect.width) * width;
+    const i = Math.min(n - 1, Math.max(0, Math.floor(px / pitch)));
+    const second = from + Math.floor((px / width) * span);
+    const b0 = from + i * bucket;
+    const silence = t.silences.find((g) => second >= g.start && second < g.start + g.seconds);
+    chart.querySelectorAll("rect.bar.hover").forEach((r) => r.classList.remove("hover"));
+    const bar = chart.querySelector('rect.bar[data-i="' + i + '"]');
+    if (bar) bar.classList.add("hover");
+    tip.innerHTML = (b0 + bucket <= t.start ? "<b>not recording</b> — service not started" :
+      "<b>" + fmt(sums[i]) + "</b> request" + (sums[i] === 1 ? "" : "s")) +
+      "<small>" + clock(b0) + " – " + clock(b0 + bucket - 1) + "</small>" +
+      (silence ? '<small style="color:var(--warn)">silent ' + durationText(silence.seconds) +
+        " from " + clock(silence.start) + (silence.ongoing ? " (ongoing)" : "") + "</small>" : "");
+    tip.style.display = "block";
+    const hostRect = host.parentElement.getBoundingClientRect();
+    const left = e.clientX - hostRect.left + 12;
+    tip.style.left = Math.min(left, hostRect.width - tip.offsetWidth - 4) + "px";
+    tip.style.top = (e.clientY - hostRect.top + 12) + "px";
+  });
+  chart.addEventListener("mouseleave", () => {
+    tip.style.display = "none";
+    chart.querySelectorAll("rect.bar.hover").forEach((r) => r.classList.remove("hover"));
+  });
+
+  // Summary + table view of the silences, newest first.
+  const last = t.last_request ? "last request " + agoText(t.last_request) : "no requests in the last hour";
+  $("traffic-summary").textContent = fmt(t.total) + " in window · " + last + " · " +
+    t.silences.length + " silence" + (t.silences.length === 1 ? "" : "s") + " ≥ " + t.min_gap + "s";
+  const rows = t.silences.slice().reverse().map((g) =>
+    "<tr><td>" + clock(g.start) + "</td><td class=\"num\">" + durationText(g.seconds) + "</td><td>" +
+    (g.ongoing ? '<span class="badge">ongoing</span>' : clock(g.start + g.seconds)) + "</td></tr>");
+  $("silence-table").querySelector("tbody").innerHTML = rows.length
+    ? "<tr><th>Silent from</th><th style=\"text-align:right\">For</th><th>Traffic resumed</th></tr>" + rows.join("")
+    : '<tr><td class="empty">No silences of ' + t.min_gap + "s or longer since traffic began.</td></tr>";
+}
+
+$("range-select").value = String(range);
+$("range-select").onchange = (e) => {
+  range = parseInt(e.target.value, 10);
+  try { localStorage.setItem(RANGE_KEY, String(range)); } catch (_) {}
+  renderTraffic();
+};
+$("gap-select").value = String(minGap);
+$("gap-select").onchange = (e) => {
+  minGap = parseInt(e.target.value, 10);
+  try { localStorage.setItem(GAP_KEY, String(minGap)); } catch (_) {}
+  loadTraffic().catch((err) => toast(err.message, "err"));
+};
+window.addEventListener("resize", renderTraffic);
+
 // ------------------------------------------------------------ poll loop
 
 async function refresh() {
@@ -521,6 +702,7 @@ async function refresh() {
         "changes are live but will be lost on restart.";
     }
 
+    await loadTraffic();
     await loadDenyLists();
 
     $("dot").className = "dot live";

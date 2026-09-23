@@ -122,6 +122,7 @@ pub async fn start_server_with_api(
     let api_state = multi_buy_service::api::ApiState::new(
         state.deny_lists(),
         state.deny_list_store(),
+        state.traffic(),
         metrics_exporter_prometheus::PrometheusBuilder::new()
             .build_recorder()
             .handle(),

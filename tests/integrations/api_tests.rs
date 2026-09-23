@@ -553,3 +553,27 @@ async fn metrics_break_denials_down_by_reason_and_region() {
     assert_eq!(view["activity_since_start"]["regions"]["denied"], 2);
     assert_eq!(view["activity_since_start"]["hotspots"]["denied"], 2);
 }
+
+#[tokio::test]
+async fn traffic_endpoint_counts_grpc_requests() {
+    let settings = common::test_settings();
+    let grpc_addr = common::available_port().await;
+    let (_shutdown, api) = common::start_server_with_api(&settings, grpc_addr).await;
+    let mut client = common::connect_client(grpc_addr).await;
+
+    for key in ["t1", "t2", "t3"] {
+        common::inc(&mut client, key, vec![], Region::Us915 as i32).await;
+    }
+
+    let (status, body) = common::http(api, "GET", "/api/v1/traffic?min_gap=5", None, None).await;
+    assert_eq!(status, 200, "body was {body}");
+    let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(view["total"], 3, "body was {body}");
+    assert_eq!(view["min_gap"], 5);
+    assert_eq!(view["window_seconds"], 3600);
+    assert!(view["last_request"].is_u64(), "body was {body}");
+    assert!(
+        view["silences"].as_array().unwrap().is_empty(),
+        "body was {body}"
+    );
+}

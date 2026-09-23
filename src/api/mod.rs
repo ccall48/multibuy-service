@@ -8,8 +8,9 @@
 pub mod settings;
 
 use crate::deny_lists::{self, DenyListStore, DenyLists};
+use crate::traffic::{self, Silence, Traffic};
 use axum::{
-    extract::{Path, Request, State},
+    extract::{Path, Query, Request, State},
     http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
@@ -30,6 +31,7 @@ const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 pub struct ApiState {
     deny_lists: Arc<DenyLists>,
     store: Arc<DenyListStore>,
+    traffic: Arc<Traffic>,
     metrics: PrometheusHandle,
     auth_token: Option<Arc<String>>,
     grpc_listen: SocketAddr,
@@ -41,6 +43,7 @@ impl ApiState {
     pub fn new(
         deny_lists: Arc<DenyLists>,
         store: Arc<DenyListStore>,
+        traffic: Arc<Traffic>,
         metrics: PrometheusHandle,
         auth_token: Option<String>,
         grpc_listen: SocketAddr,
@@ -49,6 +52,7 @@ impl ApiState {
         Self {
             deny_lists,
             store,
+            traffic,
             metrics,
             auth_token: auth_token.map(Arc::new),
             grpc_listen,
@@ -69,6 +73,7 @@ pub fn router(state: ApiState) -> Router {
     let api = Router::new()
         .route("/api/v1/info", get(info))
         .route("/api/v1/metrics", get(metrics))
+        .route("/api/v1/traffic", get(get_traffic))
         .route("/api/v1/regions", get(known_regions))
         .route("/api/v1/animal-name/{hotspot}", get(lookup_animal_name))
         .route("/api/v1/deny-list", get(get_deny_list))
@@ -222,6 +227,51 @@ async fn metrics(State(state): State<ApiState>) -> Response {
         state.metrics.render(),
     )
         .into_response()
+}
+
+#[derive(Deserialize)]
+struct TrafficQuery {
+    /// Shortest run of empty seconds worth reporting as a silence.
+    #[serde(default = "default_min_gap")]
+    min_gap: u64,
+}
+
+fn default_min_gap() -> u64 {
+    10
+}
+
+#[derive(Serialize)]
+struct TrafficView {
+    /// Unix second of `counts[0]`; `counts[i]` is requests in second `start + i`.
+    start: u64,
+    counts: Vec<u32>,
+    total: u64,
+    /// Unix second of the most recent request in the window, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_request: Option<u64>,
+    min_gap: u64,
+    window_seconds: u64,
+    silences: Vec<Silence>,
+}
+
+/// Requests per second over the last hour, plus the stretches where none
+/// arrived — which is how an upstream that has stopped calling (e.g. HPR in
+/// backoff) shows up from this side.
+async fn get_traffic(
+    State(state): State<ApiState>,
+    Query(query): Query<TrafficQuery>,
+) -> Json<TrafficView> {
+    let snapshot = state.traffic.snapshot();
+    let min_gap = query.min_gap.max(1);
+    Json(TrafficView {
+        total: snapshot.total(),
+        last_request: snapshot.last_request(),
+        silences: snapshot.silences(min_gap),
+        min_gap,
+        window_seconds: traffic::WINDOW_SECS,
+        start: snapshot.start,
+        counts: snapshot.counts,
+    })
 }
 
 #[derive(Serialize)]
