@@ -627,11 +627,13 @@ async fn traffic_endpoint_flags_copies_after_the_dedup_window() {
     let (_shutdown, api) = common::start_server_with_api(&settings, grpc_addr).await;
     let mut client = common::connect_client(grpc_addr).await;
 
-    // Two copies inside the window, then one after it.
-    common::inc(&mut client, "pkt", vec![], Region::Us915 as i32).await;
-    common::inc(&mut client, "pkt", vec![], Region::Us915 as i32).await;
+    // Two copies inside the window, then one after it from another hotspot.
+    let a = HOTSPOT_A.as_bytes().to_vec();
+    let b = HOTSPOT_B.as_bytes().to_vec();
+    common::inc(&mut client, "pkt", a.clone(), Region::Us915 as i32).await;
+    common::inc(&mut client, "pkt", a, Region::Us915 as i32).await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    common::inc(&mut client, "pkt", vec![], Region::Us915 as i32).await;
+    common::inc(&mut client, "pkt", b, Region::Us915 as i32).await;
 
     let (status, body) = common::http(api, "GET", "/api/v1/traffic", None, None).await;
     assert_eq!(status, 200, "body was {body}");
@@ -647,7 +649,24 @@ async fn traffic_endpoint_flags_copies_after_the_dedup_window() {
         .sum();
     assert_eq!(late, 1, "body was {body}");
     assert!(
-        view["repeats"].as_array().unwrap().is_empty(),
+        view["resends"].as_array().unwrap().is_empty(),
         "body was {body}"
     );
+    assert!(
+        view["slow_copies"].as_array().unwrap().is_empty(),
+        "body was {body}"
+    );
+
+    // The late copy is pinned on the hotspot that sent it.
+    let hotspots = view["late_hotspots"].as_array().unwrap();
+    assert_eq!(hotspots.len(), 1, "body was {body}");
+    assert_eq!(hotspots[0]["address"], HOTSPOT_B);
+    assert_eq!(hotspots[0]["name"], animal_name(HOTSPOT_B).as_str());
+    assert_eq!(hotspots[0]["late"], 1);
+
+    // All three came from this test's one client address.
+    let peers = view["peers"].as_array().unwrap();
+    assert_eq!(peers.len(), 1, "body was {body}");
+    assert_eq!(peers[0]["ip"], "127.0.0.1");
+    assert_eq!(peers[0]["total"], 3);
 }

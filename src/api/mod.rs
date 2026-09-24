@@ -254,8 +254,16 @@ struct TrafficView {
     total: u64,
     /// Copies that arrived after the LNS dedup window, as `[second, count]`.
     late: Vec<(u64, u32)>,
-    /// The same packet again after `repeat_after_ms`, as `[second, count]`.
-    repeats: Vec<(u64, u32)>,
+    /// The same packet again after `repeat_after_ms` from a hotspot that had
+    /// already sent it — the device transmitted again — as `[second, count]`.
+    resends: Vec<(u64, u32)>,
+    /// The same packet after `repeat_after_ms` from a hotspot that hadn't sent
+    /// it yet — that hotspot delivered late — as `[second, count]`.
+    slow_copies: Vec<(u64, u32)>,
+    /// Requests per HPR client address, busiest first.
+    peers: Vec<PeerTraffic>,
+    /// Hotspots with late arrivals since the process started, worst first.
+    late_hotspots: Vec<HotspotTimingView>,
     dedup_window_ms: u64,
     repeat_after_ms: u64,
     /// Unix second of the most recent request in the window, if any.
@@ -265,6 +273,28 @@ struct TrafficView {
     window_seconds: u64,
     silences: Vec<Silence>,
 }
+
+#[derive(Serialize)]
+struct PeerTraffic {
+    ip: String,
+    total: u64,
+    /// `[second, count]` for seconds with requests.
+    requests: Vec<(u64, u32)>,
+}
+
+#[derive(Serialize)]
+struct HotspotTimingView {
+    address: String,
+    name: String,
+    late: u64,
+    slow: u64,
+    resends: u64,
+    /// Unix seconds of the most recent late arrival of any kind.
+    last: u64,
+}
+
+/// How many hotspots `late_hotspots` lists.
+const LATE_HOTSPOTS_SHOWN: usize = 25;
 
 /// Requests per second over the last hour, plus the stretches where none
 /// arrived — which is how an upstream that has stopped calling (e.g. HPR in
@@ -280,7 +310,10 @@ async fn get_traffic(
     let min_gap = query.min_gap.max(1);
     Json(TrafficView {
         late: state.traffic.late.snapshot_at(now).nonzero(),
-        repeats: state.traffic.repeats.snapshot_at(now).nonzero(),
+        resends: state.traffic.resends.snapshot_at(now).nonzero(),
+        slow_copies: state.traffic.slow_copies.snapshot_at(now).nonzero(),
+        peers: peer_traffic(&state.traffic, now),
+        late_hotspots: late_hotspots(&state.traffic),
         dedup_window_ms: state.traffic.dedup_window.as_millis() as u64,
         repeat_after_ms: traffic::REPEAT_AFTER.as_millis() as u64,
         total: snapshot.total(),
@@ -291,6 +324,59 @@ async fn get_traffic(
         start: snapshot.start,
         counts: snapshot.counts,
     })
+}
+
+fn peer_traffic(traffic: &Traffic, now: u64) -> Vec<PeerTraffic> {
+    let mut out: Vec<PeerTraffic> = traffic
+        .peers
+        .iter()
+        .map(|entry| {
+            let snapshot = entry.value().snapshot_at(now);
+            PeerTraffic {
+                ip: entry.key().to_string(),
+                total: snapshot.total(),
+                requests: snapshot.nonzero(),
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| b.total.cmp(&a.total).then_with(|| a.ip.cmp(&b.ip)));
+    out
+}
+
+fn late_hotspots(traffic: &Traffic) -> Vec<HotspotTimingView> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut rows: Vec<(String, u64, u64, u64, u64)> = traffic
+        .hotspots
+        .iter()
+        .map(|e| {
+            let t = e.value();
+            (
+                e.key().clone(),
+                t.late.load(Relaxed),
+                t.slow.load(Relaxed),
+                t.resends.load(Relaxed),
+                t.last.load(Relaxed),
+            )
+        })
+        .collect();
+    // Hotspot delivery problems first (late + slow); resends are the device's.
+    rows.sort_by(|a, b| {
+        (b.1 + b.2, b.3, b.4)
+            .cmp(&(a.1 + a.2, a.3, a.4))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    rows.truncate(LATE_HOTSPOTS_SHOWN);
+    // Animal names are an md5 each, so only for the rows actually returned.
+    rows.into_iter()
+        .map(|(address, late, slow, resends, last)| HotspotTimingView {
+            name: deny_lists::animal_name(&address),
+            address,
+            late,
+            slow,
+            resends,
+            last,
+        })
+        .collect()
 }
 
 #[derive(Serialize)]

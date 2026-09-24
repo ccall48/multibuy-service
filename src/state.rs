@@ -108,14 +108,18 @@ impl multi_buy_server::MultiBuy for State {
         let start = std::time::Instant::now();
         crate::metrics::increment_hit();
 
+        let peer = request.remote_addr().map(|addr| addr.ip());
         let multi_buy_req = request.into_inner();
         // Records a hit against each entry that matched, so the admin API can
         // report which rules are actually doing work.
         let matched = self.deny_lists.check(&multi_buy_req);
         let denied = matched.is_denied();
-        let (count, since_first) = self.cache.inc(multi_buy_req.key.clone());
-        self.traffic.record(since_first);
+        let seen = self
+            .cache
+            .inc(multi_buy_req.key.clone(), &multi_buy_req.hotspot_key);
+        let count = seen.count;
         let hotspot = String::from_utf8_lossy(&multi_buy_req.hotspot_key).into_owned();
+        self.traffic.record(&seen, &hotspot, peer);
         // The proto region is an integer; log the name so a denial is readable
         // without a lookup table.
         let region = crate::deny_lists::region_label(multi_buy_req.region);

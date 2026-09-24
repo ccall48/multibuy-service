@@ -16,7 +16,10 @@
 //! "late" (after the dedup window) or "repeats" (seconds later: a device
 //! resending an unacknowledged frame, or a copy stalled behind a failed call).
 
+use crate::cache::Seen;
+use dashmap::DashMap;
 use serde::Serialize;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -68,6 +71,13 @@ fn unpack(slot: u64) -> (u64, u32) {
 /// copies normally land well inside that.
 pub const REPEAT_AFTER: Duration = Duration::from_secs(3);
 
+/// Most hotspots tracked for late-copy attribution. The hotspots that hear one
+/// operator's devices number in the tens; the cap only guards memory.
+const MAX_HOTSPOTS: usize = 2_000;
+
+/// Most HPR client addresses tracked for per-HPR traffic.
+const MAX_PEERS: usize = 32;
+
 /// How one request relates to earlier requests for the same packet key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arrival {
@@ -78,30 +88,55 @@ pub enum Arrival {
     /// A later copy, after the dedup window: the LNS will likely see it as a
     /// separate uplink with a repeated frame count.
     Late,
-    /// The same packet seconds later: a device resend or a stalled copy.
-    Repeat,
+    /// The same packet seconds later, from a hotspot that already sent it: the
+    /// device transmitted the frame again (an unacknowledged confirmed uplink).
+    Resend,
+    /// The same packet seconds later, from a hotspot that hadn't sent it yet:
+    /// that hotspot delivered its copy late (slow backhaul, or buffered).
+    SlowCopy,
 }
 
 impl Arrival {
-    /// Classify a request by how long after the first copy it arrived
-    /// (`None` for the first copy itself).
-    pub fn classify(since_first: Option<Duration>, dedup_window: Duration) -> Self {
-        match since_first {
+    /// Classify a request by how long after the first copy it arrived, and
+    /// whether its hotspot had already sent this packet.
+    pub fn classify(seen: &Seen, dedup_window: Duration) -> Self {
+        match seen.since_first {
             None => Self::First,
-            Some(d) if d >= REPEAT_AFTER => Self::Repeat,
+            Some(d) if d >= REPEAT_AFTER && seen.same_hotspot => Self::Resend,
+            Some(d) if d >= REPEAT_AFTER => Self::SlowCopy,
             Some(d) if d > dedup_window => Self::Late,
             Some(_) => Self::OnTime,
         }
     }
 }
 
-/// Per-second history of all requests, plus the late copies and repeats among
-/// them.
+/// Late arrivals attributed to one hotspot.
+#[derive(Debug, Default)]
+pub struct HotspotTiming {
+    /// Copies after the dedup window but under [`REPEAT_AFTER`].
+    pub late: AtomicU64,
+    /// Copies [`REPEAT_AFTER`] or more after the first, from this hotspot's
+    /// first copy of the packet.
+    pub slow: AtomicU64,
+    /// The packet again from this hotspot after it had already sent it.
+    pub resends: AtomicU64,
+    /// Unix seconds of the most recent of any of the above.
+    pub last: AtomicU64,
+}
+
+/// Per-second history of all requests, the late arrivals among them, and which
+/// hotspots and HPR instances they came from.
 pub struct Traffic {
     pub requests: PerSecond,
     pub late: PerSecond,
-    pub repeats: PerSecond,
+    pub resends: PerSecond,
+    pub slow_copies: PerSecond,
     pub dedup_window: Duration,
+    /// Keyed by the hotspot's b58 address.
+    pub hotspots: DashMap<String, HotspotTiming>,
+    /// Requests per HPR client IP. Keyed by IP rather than connection so an HPR
+    /// keeps one history across reconnects.
+    pub peers: DashMap<IpAddr, PerSecond>,
 }
 
 impl Traffic {
@@ -109,26 +144,70 @@ impl Traffic {
         Self {
             requests: PerSecond::new(),
             late: PerSecond::new(),
-            repeats: PerSecond::new(),
+            resends: PerSecond::new(),
+            slow_copies: PerSecond::new(),
             dedup_window,
+            hotspots: DashMap::new(),
+            peers: DashMap::new(),
         }
     }
 
-    /// Record one request, given how long after its packet's first copy it
-    /// arrived (`None` if it is the first).
-    pub fn record(&self, since_first: Option<Duration>) -> Arrival {
+    /// Record one request: what the cache knew about its packet, the hotspot
+    /// that heard it, and the HPR that sent it.
+    pub fn record(&self, seen: &Seen, hotspot: &str, peer: Option<IpAddr>) -> Arrival {
         let second = now_unix();
         self.requests.record_at(second);
-        let arrival = Arrival::classify(since_first, self.dedup_window);
-        match arrival {
-            Arrival::Late => self.late.record_at(second),
-            Arrival::Repeat => self.repeats.record_at(second),
-            Arrival::First | Arrival::OnTime => {}
+        if let Some(ip) = peer {
+            self.record_peer(ip, second);
         }
-        if let (Some(delay), Arrival::OnTime | Arrival::Late) = (since_first, arrival) {
+
+        let arrival = Arrival::classify(seen, self.dedup_window);
+        let series = match arrival {
+            Arrival::Late => Some(&self.late),
+            Arrival::Resend => Some(&self.resends),
+            Arrival::SlowCopy => Some(&self.slow_copies),
+            Arrival::First | Arrival::OnTime => None,
+        };
+        if let Some(series) = series {
+            series.record_at(second);
+            self.record_hotspot(hotspot, arrival, second);
+        }
+        if let (Some(delay), Arrival::OnTime | Arrival::Late) = (seen.since_first, arrival) {
             crate::metrics::record_copy_delay(delay);
         }
         arrival
+    }
+
+    fn record_peer(&self, ip: IpAddr, second: u64) {
+        if let Some(history) = self.peers.get(&ip) {
+            history.record_at(second);
+            return;
+        }
+        if self.peers.len() < MAX_PEERS {
+            self.peers.entry(ip).or_default().record_at(second);
+        }
+    }
+
+    fn record_hotspot(&self, hotspot: &str, arrival: Arrival, second: u64) {
+        if hotspot.is_empty() {
+            return;
+        }
+        let bump = |timing: &HotspotTiming| {
+            let counter = match arrival {
+                Arrival::Late => &timing.late,
+                Arrival::SlowCopy => &timing.slow,
+                _ => &timing.resends,
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+            timing.last.store(second, Ordering::Relaxed);
+        };
+        if let Some(timing) = self.hotspots.get(hotspot) {
+            bump(&timing);
+            return;
+        }
+        if self.hotspots.len() < MAX_HOTSPOTS {
+            bump(&self.hotspots.entry(hotspot.to_string()).or_default());
+        }
     }
 }
 
@@ -300,16 +379,90 @@ mod tests {
     }
 
     #[test]
-    fn arrivals_are_classified_by_delay_after_first_copy() {
+    fn arrivals_are_classified_by_delay_and_hotspot() {
         let window = Duration::from_millis(200);
-        let at = |ms| Arrival::classify(Some(Duration::from_millis(ms)), window);
-        assert_eq!(Arrival::classify(None, window), Arrival::First);
-        assert_eq!(at(0), Arrival::OnTime);
-        assert_eq!(at(200), Arrival::OnTime);
-        assert_eq!(at(201), Arrival::Late);
-        assert_eq!(at(2_999), Arrival::Late);
-        assert_eq!(at(3_000), Arrival::Repeat);
-        assert_eq!(at(600_000), Arrival::Repeat);
+        let at = |ms, same_hotspot| {
+            Arrival::classify(
+                &Seen {
+                    count: 2,
+                    since_first: Some(Duration::from_millis(ms)),
+                    same_hotspot,
+                },
+                window,
+            )
+        };
+        let first = Seen {
+            count: 1,
+            since_first: None,
+            same_hotspot: false,
+        };
+        assert_eq!(Arrival::classify(&first, window), Arrival::First);
+        assert_eq!(at(0, false), Arrival::OnTime);
+        assert_eq!(at(200, false), Arrival::OnTime);
+        assert_eq!(at(201, false), Arrival::Late);
+        assert_eq!(at(2_999, true), Arrival::Late);
+        assert_eq!(at(3_000, true), Arrival::Resend);
+        assert_eq!(at(3_000, false), Arrival::SlowCopy);
+        assert_eq!(at(600_000, true), Arrival::Resend);
+    }
+
+    #[test]
+    fn repeats_are_attributed_to_their_hotspot() {
+        let traffic = Traffic::new(Duration::from_millis(200));
+        let seen = |ms, same_hotspot| Seen {
+            count: 2,
+            since_first: Some(Duration::from_millis(ms)),
+            same_hotspot,
+        };
+        assert_eq!(
+            traffic.record(&seen(500, false), "hs-a", None),
+            Arrival::Late
+        );
+        assert_eq!(
+            traffic.record(&seen(4_000, false), "hs-b", None),
+            Arrival::SlowCopy
+        );
+        assert_eq!(
+            traffic.record(&seen(9_000, true), "hs-b", None),
+            Arrival::Resend
+        );
+        assert_eq!(
+            traffic.record(&seen(10, false), "hs-c", None),
+            Arrival::OnTime
+        );
+
+        let get = |h: &str| {
+            let t = traffic.hotspots.get(h).unwrap();
+            (
+                t.late.load(Ordering::Relaxed),
+                t.slow.load(Ordering::Relaxed),
+                t.resends.load(Ordering::Relaxed),
+            )
+        };
+        assert_eq!(get("hs-a"), (1, 0, 0));
+        assert_eq!(get("hs-b"), (0, 1, 1));
+        // On-time copies aren't attributed to anyone.
+        assert!(traffic.hotspots.get("hs-c").is_none());
+    }
+
+    #[test]
+    fn requests_are_counted_per_peer() {
+        let traffic = Traffic::new(Duration::from_millis(200));
+        let first = Seen {
+            count: 1,
+            since_first: None,
+            same_hotspot: false,
+        };
+        let a: IpAddr = "10.0.0.1".parse().unwrap();
+        let b: IpAddr = "10.0.0.2".parse().unwrap();
+        traffic.record(&first, "", Some(a));
+        traffic.record(&first, "", Some(a));
+        traffic.record(&first, "", Some(b));
+        traffic.record(&first, "", None);
+        let total = |ip| traffic.peers.get(&ip).unwrap().snapshot().total();
+        assert_eq!(total(a), 2);
+        assert_eq!(total(b), 1);
+        assert_eq!(traffic.requests.snapshot().total(), 4);
     }
 
     #[test]

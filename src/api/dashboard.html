@@ -106,6 +106,7 @@
   .traffic .body { position: relative; }
   .traffic svg.chart { display: block; width: 100%; height: auto; overflow: visible; }
   .traffic rect.late { fill: var(--late); }
+  .traffic rect.peer { fill: var(--accent); opacity: .75; }
   .traffic .strip-label { fill: var(--muted); font-size: 11px; paint-order: stroke;
                           stroke: var(--panel); stroke-width: 3px; stroke-linejoin: round; }
   .traffic .axis text { fill: var(--muted); font-size: 11px; font-family: var(--mono); }
@@ -171,10 +172,13 @@
         <span><i style="background:var(--warn);opacity:.5"></i>silence (no requests arrived)</span>
         <span><i style="background:var(--ok);width:3px"></i>HPR connected</span>
         <span><i style="background:var(--bad);width:3px"></i>HPR disconnected</span>
-        <span id="late-legend"><i style="background:var(--late)"></i>late copies &amp; repeats (rows below chart)</span></div>
+        <span id="late-legend"><i style="background:var(--late)"></i>late &amp; repeated copies (rows below)</span>
+        <span><i style="background:var(--accent);opacity:.75"></i>requests per HPR (rows below)</span></div>
       <div id="traffic-chart"></div>
       <div class="tip" id="traffic-tip"></div>
       <table id="silence-table"><tbody></tbody></table>
+      <h3>Hotspots delivering late <span style="font-weight:400">— since the service started</span></h3>
+      <table id="late-hotspot-table"><tbody></tbody></table>
       <h3>Connections</h3>
       <table id="conn-table"><tbody></tbody></table>
       <div class="hint">HPR stops calling this service for a route while it backs off after a failed request
@@ -182,8 +186,9 @@
         appear here as silences in otherwise steady traffic.<br>
         HPR also waits for this service before forwarding each copy to your LNS. A <b>late copy</b> reached
         us more than the LNS dedup window (<code>lns_dedup_window</code>) after the first copy of the same packet,
-        so the LNS likely logged it as a retransmission. A <b>repeat</b> is the same packet 3s or more later:
-        a device resending an unacknowledged frame, or a copy stuck behind a failed call.</div>
+        so the LNS likely logged it as a retransmission. 3s or more later, a copy from a hotspot that already sent
+        the packet is a <b>device resend</b> (the device didn't get its ACK); from a new hotspot it's a
+        <b>slow hotspot</b> delivering its copy late.</div>
     </div>
   </section>
 
@@ -588,11 +593,6 @@ function renderTraffic() {
   const from = end - span + 1;                        // chart spans the chosen range
   const host = $("traffic-chart");
   const width = Math.max(280, host.clientWidth || 800);
-  // Main plot, then two strip rows (late copies, repeats) on the same time axis.
-  const top = 8, plotH = 130, stripH = 18, stripGap = 6, bottom = 22;
-  const stripY = [top + plotH + 8, top + plotH + 8 + stripH + stripGap];
-  const height = stripY[1] + stripH + bottom;
-
   // Coarsen buckets on narrow screens so each bar keeps a few pixels.
   const bucket = [1, 2, 5, 10, 15, 20, 30, 60, 120].find((b) => (span / b) * 5 <= width) || 120;
   const n = Math.ceil(span / bucket);
@@ -607,8 +607,29 @@ function renderTraffic() {
     for (const [second, c] of pairs || []) if (second >= from) out[Math.floor((second - from) / bucket)] += c;
     return out;
   };
-  const lateSums = bucketed(t.late), repeatSums = bucketed(t.repeats);
-  const lateTotal = lateSums.reduce((a, b) => a + b, 0), repeatTotal = repeatSums.reduce((a, b) => a + b, 0);
+  const total = (vals) => vals.reduce((a, b) => a + b, 0);
+
+  // Strip rows under the main plot, on the same time axis, each scaled to its
+  // own peak: first the late arrivals, then one row per HPR address.
+  const repeatS = t.repeat_after_ms / 1000;
+  const rowsDef = [
+    { key: "late", label: "late copies > " + t.dedup_window_ms + "ms", vals: bucketed(t.late), cls: "late" },
+    { key: "resend", label: "device resends ≥ " + repeatS + "s", vals: bucketed(t.resends), cls: "late" },
+    { key: "slow", label: "slow hotspot ≥ " + repeatS + "s", vals: bucketed(t.slow_copies), cls: "late" },
+    ...(t.peers || []).map((p) => ({ key: "peer", label: "HPR " + p.ip, vals: bucketed(p.requests), cls: "peer" })),
+  ];
+  const top = 8, plotH = 130, stripH = 18, stripGap = 6, bottom = 22;
+  let y = top + plotH + 8;
+  for (const [k, row] of rowsDef.entries()) {
+    if (row.key === "peer" && (k === 0 || rowsDef[k - 1].key !== "peer")) y += 8;   // gap before HPR rows
+    row.y = y;
+    row.total = total(row.vals);
+    y += stripH + stripGap;
+  }
+  const rowsBottom = y - stripGap;
+  const height = rowsBottom + bottom;
+  const [lateRow, resendRow, slowRow] = rowsDef;
+  const peerRows = rowsDef.filter((r) => r.key === "peer");
   const x = (second) => (Math.max(0, second - from) / span) * width;
   const pitch = width / n, barW = Math.max(1, pitch - 2);
 
@@ -619,7 +640,7 @@ function renderTraffic() {
   for (const g of t.silences) {
     if (g.start + g.seconds <= from) continue;
     const x0 = x(g.start), w = Math.max(2, x(g.start + g.seconds) - x0);
-    svg += '<rect class="silence" x="' + x0 + '" y="' + top + '" width="' + w + '" height="' + plotH + '"/>' +
+    svg += '<rect class="silence" x="' + x0 + '" y="' + top + '" width="' + w + '" height="' + (rowsBottom - top) + '"/>' +
       '<rect class="silence-edge" x="' + x0 + '" y="' + top + '" width="' + w + '" height="2"/>';
   }
 
@@ -630,21 +651,18 @@ function renderTraffic() {
       '" width="' + barW + '" height="' + h + '" rx="' + Math.min(2, barW / 2) + '"/>';
   });
 
-  // Strip rows: each scaled to its own peak, since they're a small slice of
-  // all requests and would vanish on the main scale.
-  [[lateSums, "late copies > " + t.dedup_window_ms + "ms", lateTotal],
-   [repeatSums, "repeats ≥ " + t.repeat_after_ms / 1000 + "s", repeatTotal]].forEach(([vals, label, total], row) => {
-    const y0 = stripY[row], rowMax = Math.max(1, ...vals);
-    svg += '<line x1="0" x2="' + width + '" y1="' + (y0 + stripH) + '" y2="' + (y0 + stripH) +
+  for (const row of rowsDef) {
+    const rowMax = Math.max(1, ...row.vals);
+    svg += '<line x1="0" x2="' + width + '" y1="' + (row.y + stripH) + '" y2="' + (row.y + stripH) +
       '" stroke="var(--border)"/>';
-    vals.forEach((v, i) => {
+    row.vals.forEach((v, i) => {
       if (!v) return;
       const h = Math.max(2, (v / rowMax) * stripH);
-      svg += '<rect class="late" x="' + (i * pitch + 1) + '" y="' + (y0 + stripH - h) + '" width="' + barW +
+      svg += '<rect class="' + row.cls + '" x="' + (i * pitch + 1) + '" y="' + (row.y + stripH - h) + '" width="' + barW +
         '" height="' + h + '" rx="' + Math.min(1.5, barW / 2) + '"/>';
     });
-    svg += '<text class="strip-label" x="0" y="' + (y0 + 11) + '">' + label + ' · ' + fmt(total) + '</text>';
-  });
+    svg += '<text class="strip-label" x="0" y="' + (row.y + 11) + '">' + row.label + ' · ' + fmt(row.total) + '</text>';
+  }
 
   // Connection opens/closes as thin full-height rules with a cap, drawn over
   // the bars so a reconnect right after a silence is easy to spot.
@@ -691,8 +709,11 @@ function renderTraffic() {
       "<small>" + clock(b0) + " – " + clock(b0 + bucket - 1) + "</small>" +
       (silence ? '<small style="color:var(--warn)">silent ' + durationText(silence.seconds) +
         " from " + clock(silence.start) + (silence.ongoing ? " (ongoing)" : "") + "</small>" : "") +
-      (lateSums[i] || repeatSums[i] ? '<small style="color:var(--late)">' + fmt(lateSums[i]) + " late · " +
-        fmt(repeatSums[i]) + " repeat" + (repeatSums[i] === 1 ? "" : "s") + "</small>" : "") +
+      (lateRow.vals[i] || resendRow.vals[i] || slowRow.vals[i]
+        ? '<small style="color:var(--late)">' + fmt(lateRow.vals[i]) + " late · " + fmt(resendRow.vals[i]) +
+          " resent · " + fmt(slowRow.vals[i]) + " slow hotspot</small>" : "") +
+      (peerRows.length > 1
+        ? "<small>" + peerRows.map((r) => r.label.slice(4) + " " + fmt(r.vals[i])).join(" · ") + "</small>" : "") +
       tipEvents(events.filter((ev) => ev.at >= b0 && ev.at < b0 + bucket));
     tip.style.display = "block";
     const hostRect = host.parentElement.getBoundingClientRect();
@@ -712,8 +733,9 @@ function renderTraffic() {
     t.silences.length + " silence" + (t.silences.length === 1 ? "" : "s") + " ≥ " + t.min_gap + "s" +
     (conns ? " · " + conns.active + " connection" + (conns.active === 1 ? "" : "s") + " open · " +
       reconnects + " connect" + (reconnects === 1 ? "" : "s") + " in view" : "") +
-    " · " + fmt(lateTotal) + " late cop" + (lateTotal === 1 ? "y" : "ies") + " · " +
-    fmt(repeatTotal) + " repeat" + (repeatTotal === 1 ? "" : "s");
+    " · " + fmt(lateRow.total) + " late · " + fmt(resendRow.total) + " resent · " +
+    fmt(slowRow.total) + " slow hotspot";
+  renderLateHotspots();
   renderConnections();
   const rows = t.silences.slice().reverse().map((g) =>
     "<tr><td>" + clock(g.start) + "</td><td class=\"num\">" + durationText(g.seconds) + "</td><td>" +
@@ -730,6 +752,20 @@ function tipEvents(list) {
     '<small style="color:var(--' + (ev.kind === "opened" ? "ok" : "bad") + ')">' + clock(ev.at) + " " +
     connText(ev) + "</small>").join("");
   return shown + (list.length > 3 ? "<small>+" + (list.length - 3) + " more connection events</small>" : "");
+}
+
+// Hotspots whose copies arrive late, worst first. Late and slow copies are the
+// hotspot's delivery; resends are the device transmitting again.
+function renderLateHotspots() {
+  const tbody = $("late-hotspot-table").querySelector("tbody");
+  const list = (traffic && traffic.late_hotspots) || [];
+  tbody.innerHTML = list.length
+    ? '<tr><th>Hotspot</th><th style="text-align:right">Late</th><th style="text-align:right">Slow ≥3s</th>' +
+      '<th style="text-align:right">Resends</th><th>Last</th></tr>' +
+      list.map((h) => '<tr><td><div>' + (h.name || "–") + '</div><div class="peer">' + h.address + "</div></td>" +
+        '<td class="num">' + fmt(h.late) + '</td><td class="num">' + fmt(h.slow) + '</td><td class="num">' +
+        fmt(h.resends) + "</td><td>" + agoText(h.last) + "</td></tr>").join("")
+    : '<tr><td class="empty">No late, slow or resent copies yet.</td></tr>';
 }
 
 function connText(ev) {
