@@ -18,13 +18,22 @@
     --bad: #ff6b6b;
     --late: #e0569f;
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color-scheme: dark;
   }
+  /* Theme: follows the system unless the header switch sets data-theme. */
   @media (prefers-color-scheme: light) {
-    :root {
+    :root:not([data-theme="dark"]) {
       --bg: #f6f7f9; --panel: #fff; --panel-2: #f0f2f5; --border: #dfe3ea;
       --text: #1a1d24; --muted: #6b7280; --accent: #2563eb;
       --ok: #16a34a; --warn: #d97706; --bad: #dc2626; --late: #a21caf;
+      color-scheme: light;
     }
+  }
+  :root[data-theme="light"] {
+      --bg: #f6f7f9; --panel: #fff; --panel-2: #f0f2f5; --border: #dfe3ea;
+      --text: #1a1d24; --muted: #6b7280; --accent: #2563eb;
+      --ok: #16a34a; --warn: #d97706; --bad: #dc2626; --late: #a21caf;
+      color-scheme: light;
   }
   * { box-sizing: border-box; }
   body {
@@ -33,12 +42,20 @@
   }
   header {
     display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
-    padding: 18px 24px; border-bottom: 1px solid var(--border); background: var(--panel);
+    border-bottom: 1px solid var(--border); background: var(--panel);
+    /* Full-width bar, contents aligned with the centred main column. */
+    padding: 18px max(24px, calc((100% - 1200px) / 2 + 24px));
   }
   header h1 { font-size: 17px; margin: 0; font-weight: 600; letter-spacing: .2px; }
   header .meta { color: var(--muted); font-size: 12px; font-family: var(--mono); }
   header .spacer { flex: 1; }
-  main { padding: 20px 24px 48px; max-width: 1200px; }
+  main { padding: 20px 24px 48px; max-width: 1200px; margin: 0 auto; }
+  .theme-switch { display: inline-flex; border: 1px solid var(--border); border-radius: 7px; overflow: hidden;
+                  align-self: center; }
+  .theme-switch button { background: transparent; color: var(--muted); border: 0; border-radius: 0;
+                         padding: 4px 10px; font-size: 12px; font-weight: 400; }
+  .theme-switch button + button { border-left: 1px solid var(--border); }
+  .theme-switch button[aria-pressed="true"] { background: var(--panel-2); color: var(--text); font-weight: 500; }
   h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em;
        color: var(--muted); margin: 28px 0 12px; font-weight: 600; }
   .cards { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
@@ -150,6 +167,14 @@
     header, main { padding-left: 16px; padding-right: 16px; }
   }
 </style>
+<script>
+  // Apply a saved theme before first paint, so a forced light/dark page
+  // doesn't flash the system theme on load.
+  try {
+    const saved = localStorage.getItem("mb_theme");
+    if (saved === "light" || saved === "dark") document.documentElement.dataset.theme = saved;
+  } catch (_) {}
+</script>
 </head>
 <body>
 <header>
@@ -157,6 +182,11 @@
   <span class="meta" id="hdr-meta">connecting…</span>
   <span class="spacer"></span>
   <span class="meta"><span class="dot" id="dot"></span> <span id="hdr-poll">–</span></span>
+  <div class="theme-switch" role="group" aria-label="Colour theme">
+    <button type="button" data-theme-choice="system">System</button>
+    <button type="button" data-theme-choice="light">Light</button>
+    <button type="button" data-theme-choice="dark">Dark</button>
+  </div>
   <button class="ghost" id="btn-token">Set token</button>
 </header>
 
@@ -971,6 +1001,27 @@ function humanize(seconds) {
   if (seconds < 86400) return Math.floor(seconds / 3600) + "h " + Math.floor((seconds % 3600) / 60) + "m";
   return Math.floor(seconds / 86400) + "d " + Math.floor((seconds % 86400) / 3600) + "h";
 }
+
+// Theme switch: "system" (default) follows the OS; light/dark override it.
+function applyTheme(choice) {
+  if (choice === "light" || choice === "dark") document.documentElement.dataset.theme = choice;
+  else delete document.documentElement.dataset.theme;
+  document.querySelectorAll("[data-theme-choice]").forEach((b) =>
+    b.setAttribute("aria-pressed", String(b.dataset.themeChoice === choice)));
+}
+let themeChoice = "system";
+try { themeChoice = localStorage.getItem("mb_theme") || "system"; } catch (_) {}
+applyTheme(themeChoice);
+document.querySelectorAll("[data-theme-choice]").forEach((b) => {
+  b.onclick = () => {
+    themeChoice = b.dataset.themeChoice;
+    try {
+      if (themeChoice === "system") localStorage.removeItem("mb_theme");
+      else localStorage.setItem("mb_theme", themeChoice);
+    } catch (_) {}
+    applyTheme(themeChoice);
+  };
+});
 
 $("btn-token").onclick = () => promptToken();
 $("region-add").onclick = () => addEntry("region");
