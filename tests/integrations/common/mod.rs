@@ -17,8 +17,8 @@ pub async fn available_port() -> SocketAddr {
 
 /// Build a test Settings with defaults.
 ///
-/// Persistence is off unless a test asks for it, so tests don't write a
-/// deny-list file into the working directory.
+/// Persistence is off unless a test asks for it, so tests don't write
+/// deny-list or hotspot files into the working directory.
 pub fn test_settings() -> Settings {
     test_settings_with_cleanup(Duration::from_secs(60 * 30))
 }
@@ -51,6 +51,7 @@ pub fn test_settings_with_cleanup(cleanup_timeout: Duration) -> Settings {
             s.grpc_listen = "127.0.0.1:0".parse().unwrap();
             s.cleanup_timeout = cleanup_timeout;
             s.deny_list_store = std::path::PathBuf::new();
+            s.hotspot_store = std::path::PathBuf::new();
             s
         },
     )
@@ -120,10 +121,7 @@ pub async fn start_server_with_api(
 ) -> (triggered::Trigger, SocketAddr) {
     let state = State::new(settings).unwrap();
     let api_state = multi_buy_service::api::ApiState::new(
-        state.deny_lists(),
-        state.deny_list_store(),
-        state.traffic(),
-        state.connections(),
+        &state,
         metrics_exporter_prometheus::PrometheusBuilder::new()
             .build_recorder()
             .handle(),

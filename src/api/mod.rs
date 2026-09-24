@@ -9,6 +9,7 @@ pub mod settings;
 
 use crate::connections::{ConnectionEvent, Connections};
 use crate::deny_lists::{self, DenyListStore, DenyLists};
+use crate::hotspots::{HotspotView, Hotspots};
 use crate::traffic::{self, Silence, Traffic};
 use axum::{
     extract::{Path, Query, Request, State},
@@ -34,6 +35,7 @@ pub struct ApiState {
     store: Arc<DenyListStore>,
     traffic: Arc<Traffic>,
     connections: Arc<Connections>,
+    hotspots: Arc<Hotspots>,
     metrics: PrometheusHandle,
     auth_token: Option<Arc<String>>,
     grpc_listen: SocketAddr,
@@ -42,22 +44,21 @@ pub struct ApiState {
 }
 
 impl ApiState {
-    #[allow(clippy::too_many_arguments)]
+    /// Share `state`'s deny lists, traffic, connections and hotspots with the
+    /// API, so changes and stats are live between the two.
     pub fn new(
-        deny_lists: Arc<DenyLists>,
-        store: Arc<DenyListStore>,
-        traffic: Arc<Traffic>,
-        connections: Arc<Connections>,
+        state: &crate::state::State,
         metrics: PrometheusHandle,
         auth_token: Option<String>,
         grpc_listen: SocketAddr,
         metrics_endpoint: SocketAddr,
     ) -> Self {
         Self {
-            deny_lists,
-            store,
-            traffic,
-            connections,
+            deny_lists: state.deny_lists(),
+            store: state.deny_list_store(),
+            traffic: state.traffic(),
+            connections: state.connections(),
+            hotspots: state.hotspots(),
             metrics,
             auth_token: auth_token.map(Arc::new),
             grpc_listen,
@@ -80,6 +81,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/v1/metrics", get(metrics))
         .route("/api/v1/traffic", get(get_traffic))
         .route("/api/v1/connections", get(get_connections))
+        .route("/api/v1/hotspots", get(get_hotspot_stats))
         .route("/api/v1/regions", get(known_regions))
         .route("/api/v1/animal-name/{hotspot}", get(lookup_animal_name))
         .route("/api/v1/deny-list", get(get_deny_list))
@@ -313,7 +315,7 @@ async fn get_traffic(
         resends: state.traffic.resends.snapshot_at(now).nonzero(),
         slow_copies: state.traffic.slow_copies.snapshot_at(now).nonzero(),
         peers: peer_traffic(&state.traffic, now),
-        late_hotspots: late_hotspots(&state.traffic),
+        late_hotspots: late_hotspots(&state.hotspots),
         dedup_window_ms: state.traffic.dedup_window.as_millis() as u64,
         repeat_after_ms: traffic::REPEAT_AFTER.as_millis() as u64,
         total: snapshot.total(),
@@ -343,40 +345,118 @@ fn peer_traffic(traffic: &Traffic, now: u64) -> Vec<PeerTraffic> {
     out
 }
 
-fn late_hotspots(traffic: &Traffic) -> Vec<HotspotTimingView> {
-    use std::sync::atomic::Ordering::Relaxed;
-    let mut rows: Vec<(String, u64, u64, u64, u64)> = traffic
-        .hotspots
-        .iter()
-        .map(|e| {
-            let t = e.value();
-            (
-                e.key().clone(),
-                t.late.load(Relaxed),
-                t.slow.load(Relaxed),
-                t.resends.load(Relaxed),
-                t.last.load(Relaxed),
-            )
-        })
+fn late_hotspots(hotspots: &Hotspots) -> Vec<HotspotTimingView> {
+    let mut rows: Vec<HotspotView> = hotspots
+        .views()
+        .into_iter()
+        .filter(|h| h.late + h.slow + h.resends > 0)
         .collect();
     // Hotspot delivery problems first (late + slow); resends are the device's.
     rows.sort_by(|a, b| {
-        (b.1 + b.2, b.3, b.4)
-            .cmp(&(a.1 + a.2, a.3, a.4))
-            .then_with(|| a.0.cmp(&b.0))
+        (b.late + b.slow, b.resends, b.last_late)
+            .cmp(&(a.late + a.slow, a.resends, a.last_late))
+            .then_with(|| a.address.cmp(&b.address))
     });
-    rows.truncate(LATE_HOTSPOTS_SHOWN);
-    // Animal names are an md5 each, so only for the rows actually returned.
     rows.into_iter()
-        .map(|(address, late, slow, resends, last)| HotspotTimingView {
-            name: deny_lists::animal_name(&address),
-            address,
-            late,
-            slow,
-            resends,
-            last,
+        .take(LATE_HOTSPOTS_SHOWN)
+        .map(|h| HotspotTimingView {
+            address: h.address,
+            name: h.name,
+            late: h.late,
+            slow: h.slow,
+            resends: h.resends,
+            last: h.last_late,
         })
         .collect()
+}
+
+#[derive(Deserialize)]
+struct HotspotsQuery {
+    /// copies (default), recent, late, delay, first_seen, name.
+    #[serde(default)]
+    sort: Option<String>,
+    /// Case-insensitive match on address or animal name.
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(default = "default_hotspots_limit")]
+    limit: usize,
+}
+
+fn default_hotspots_limit() -> usize {
+    100
+}
+
+#[derive(Serialize)]
+struct HotspotRow {
+    #[serde(flatten)]
+    stats: HotspotView,
+    /// On the deny list right now.
+    denied_now: bool,
+}
+
+#[derive(Serialize)]
+struct HotspotsListView {
+    /// Hotspots tracked in total.
+    total: usize,
+    /// Hotspots matching `q`, before `limit`.
+    matched: usize,
+    persistent: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store: Option<String>,
+    retention_days: u64,
+    hotspots: Vec<HotspotRow>,
+}
+
+/// Every hotspot that has sent this service a copy, with running stats.
+async fn get_hotspot_stats(
+    State(state): State<ApiState>,
+    Query(query): Query<HotspotsQuery>,
+) -> Result<Json<HotspotsListView>, ApiError> {
+    let mut rows = state.hotspots.views();
+    let total = rows.len();
+
+    if let Some(q) = query.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+        let q = q.to_lowercase();
+        rows.retain(|h| h.address.to_lowercase().contains(&q) || h.name.contains(&q));
+    }
+    let matched = rows.len();
+
+    // Address order first, so ties in the (stable) sort below stay put between
+    // polls instead of following DashMap's iteration order.
+    rows.sort_by(|a, b| a.address.cmp(&b.address));
+    let delay = |h: &HotspotView| h.mean_delay_ms.unwrap_or(-1.0);
+    match query.sort.as_deref().unwrap_or("copies") {
+        "copies" => rows.sort_by(|a, b| b.copies.cmp(&a.copies)),
+        "recent" => rows.sort_by(|a, b| b.last_seen.cmp(&a.last_seen)),
+        "late" => {
+            rows.sort_by(|a, b| (b.late + b.slow, b.resends).cmp(&(a.late + a.slow, a.resends)))
+        }
+        "delay" => rows.sort_by(|a, b| delay(b).total_cmp(&delay(a))),
+        "first_seen" => rows.sort_by(|a, b| b.first_seen.cmp(&a.first_seen)),
+        "name" => rows.sort_by(|a, b| a.name.cmp(&b.name)),
+        other => {
+            return Err(ApiError::bad_request(
+                format!("unknown sort '{other}'"),
+                vec!["use copies, recent, late, delay, first_seen or name".into()],
+            ))
+        }
+    }
+    rows.truncate(query.limit.clamp(1, 1_000));
+
+    Ok(Json(HotspotsListView {
+        total,
+        matched,
+        persistent: state.hotspots.is_persistent(),
+        store: state.hotspots.store_path().map(|p| p.display().to_string()),
+        retention_days: crate::hotspots::RETENTION.as_secs() / 86_400,
+        hotspots: rows
+            .into_iter()
+            .map(|stats| HotspotRow {
+                denied_now: state.deny_lists.is_hotspot_denied(&stats.address),
+                stats,
+            })
+            .collect(),
+    }))
 }
 
 #[derive(Serialize)]

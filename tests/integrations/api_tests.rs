@@ -670,3 +670,63 @@ async fn traffic_endpoint_flags_copies_after_the_dedup_window() {
     assert_eq!(peers[0]["ip"], "127.0.0.1");
     assert_eq!(peers[0]["total"], 3);
 }
+
+#[tokio::test]
+async fn hotspots_endpoint_keeps_per_hotspot_stats() {
+    let settings = common::test_settings();
+    let grpc_addr = common::available_port().await;
+    let (_shutdown, api) = common::start_server_with_api(&settings, grpc_addr).await;
+    let mut client = common::connect_client(grpc_addr).await;
+
+    let a = HOTSPOT_A.as_bytes().to_vec();
+    let b = HOTSPOT_B.as_bytes().to_vec();
+    // A is first on two packets; B is second on one.
+    common::inc(&mut client, "p1", a.clone(), Region::Eu868 as i32).await;
+    common::inc(&mut client, "p1", b, Region::Eu868 as i32).await;
+    common::inc(&mut client, "p2", a, Region::Us915 as i32).await;
+
+    let (status, body) = common::http(api, "GET", "/api/v1/hotspots", None, None).await;
+    assert_eq!(status, 200, "body was {body}");
+    let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(view["total"], 2, "body was {body}");
+    assert_eq!(view["persistent"], false);
+    let first = &view["hotspots"][0];
+    assert_eq!(
+        first["address"], HOTSPOT_A,
+        "busiest first; body was {body}"
+    );
+    assert_eq!(first["name"], animal_name(HOTSPOT_A).as_str());
+    assert_eq!(first["copies"], 2);
+    assert_eq!(first["copies_last_hour"], 2);
+    assert_eq!(first["first"], 2);
+    assert_eq!(first["regions"], serde_json::json!(["US915", "EU868"]));
+    assert_eq!(first["denied_now"], false);
+    assert_eq!(view["hotspots"][1]["second"], 1);
+
+    // Search matches the animal name.
+    let name = animal_name(HOTSPOT_B);
+    let (_, body) = common::http(
+        api,
+        "GET",
+        &format!("/api/v1/hotspots?q={name}"),
+        None,
+        None,
+    )
+    .await;
+    let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(view["matched"], 1, "body was {body}");
+    assert_eq!(view["hotspots"][0]["address"], HOTSPOT_B);
+
+    // Unknown sort is rejected rather than silently ignored.
+    let (status, _) = common::http(api, "GET", "/api/v1/hotspots?sort=bogus", None, None).await;
+    assert_eq!(status, 400);
+
+    // Denying a hotspot shows on its row.
+    let body = format!(r#"{{"hotspots":["{HOTSPOT_A}"]}}"#);
+    let (status, _) =
+        common::http(api, "POST", "/api/v1/deny-list/hotspots", None, Some(&body)).await;
+    assert_eq!(status, 200);
+    let (_, body) = common::http(api, "GET", "/api/v1/hotspots", None, None).await;
+    let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(view["hotspots"][0]["denied_now"], true, "body was {body}");
+}

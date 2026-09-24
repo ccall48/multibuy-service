@@ -26,6 +26,12 @@ grpc_listen = "0.0.0.0:6080"
 # Env: MB__DENY_LIST_STORE
 # deny_list_store = "deny-list.json"
 
+# Where per-hotspot stats are saved (every minute and on shutdown) so they
+# build up across restarts. Hotspots not seen for 30 days are dropped.
+# Set to "" to keep them in memory only.
+# Env: MB__HOTSPOT_STORE
+# hotspot_store = "hotspots.json"
+
 # Prometheus metrics endpoint
 [metrics]
 # Env: MB__METRICS__ENDPOINT

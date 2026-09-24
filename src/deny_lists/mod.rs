@@ -232,6 +232,11 @@ impl DenyLists {
         self.check(req).is_denied()
     }
 
+    /// Whether a hotspot address is currently denied.
+    pub fn is_hotspot_denied(&self, key_b58: &str) -> bool {
+        self.hotspots.contains_key(key_b58)
+    }
+
     /// Currently denied hotspot addresses, sorted.
     pub fn hotspots(&self) -> Vec<String> {
         let mut out: Vec<String> = self.hotspots.iter().map(|e| e.key().clone()).collect();

@@ -43,6 +43,10 @@ pub struct Settings {
     /// `denied_regions`, which stay the baseline.
     #[serde(default = "default_deny_list_store")]
     pub deny_list_store: PathBuf,
+    /// Where per-hotspot stats are saved so they build up across restarts.
+    /// Set to an empty string to keep them in memory only.
+    #[serde(default = "default_hotspot_store")]
+    pub hotspot_store: PathBuf,
 }
 
 pub fn default_log() -> String {
@@ -55,6 +59,10 @@ pub fn default_grpc_listen_addr() -> SocketAddr {
 
 pub fn default_deny_list_store() -> PathBuf {
     PathBuf::from("deny-list.json")
+}
+
+pub fn default_hotspot_store() -> PathBuf {
+    PathBuf::from("hotspots.json")
 }
 
 pub fn default_lns_dedup_window() -> Duration {

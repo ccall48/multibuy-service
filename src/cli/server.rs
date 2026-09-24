@@ -2,7 +2,10 @@ use crate::{
     api::ApiState,
     settings::Settings,
     state::State,
-    tasks::{api_server::ApiServer, cleanup::CacheCleanup, grpc_server::GrpcServer},
+    tasks::{
+        api_server::ApiServer, cleanup::CacheCleanup, grpc_server::GrpcServer,
+        hotspot_saver::HotspotSaver,
+    },
 };
 use metrics_exporter_prometheus::PrometheusHandle;
 use task_manager::TaskManager;
@@ -20,6 +23,7 @@ impl Server {
 
         let grpc_state = State::new(settings)?;
         let cache_cleanup = CacheCleanup::new(&grpc_state, settings.cleanup_timeout);
+        let hotspot_saver = HotspotSaver::new(grpc_state.hotspots());
         let grpc_listen = settings.grpc_listen;
 
         let mut builder = TaskManager::builder();
@@ -33,10 +37,7 @@ impl Server {
                 );
             }
             let api_state = ApiState::new(
-                grpc_state.deny_lists(),
-                grpc_state.deny_list_store(),
-                grpc_state.traffic(),
-                grpc_state.connections(),
+                &grpc_state,
                 metrics_handle,
                 settings.api.auth_token.clone(),
                 grpc_listen,
@@ -50,6 +51,7 @@ impl Server {
         builder
             .add_named("grpc", GrpcServer::new(grpc_state, grpc_listen))
             .add_named("cache-cleanup", cache_cleanup)
+            .add_named("hotspot-saver", hotspot_saver)
             .build()
             .start()
             .await

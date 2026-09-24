@@ -40,6 +40,8 @@ COPY pkg/settings-template.toml /app/config/settings.toml
 # volume over it (or bind-mount a host path) to keep them across container
 # replacement.
 ENV MB__DENY_LIST_STORE=/app/data/deny-list.json
+# Per-hotspot stats, saved every minute and on shutdown.
+ENV MB__HOTSPOT_STORE=/app/data/hotspots.json
 VOLUME /app/data
 
 EXPOSE 6080 6081 19011

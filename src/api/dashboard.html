@@ -131,6 +131,17 @@
   .traffic table { margin-top: 12px; }
   .traffic .hint { font-size: 12px; color: var(--muted); margin-top: 10px; }
   .badge { font-size: 11px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--warn); color: var(--warn); }
+  .hotspots .head input { flex: 1 1 200px; max-width: 320px; padding: 4px 9px; font-size: 12px; }
+  .hotspots .head select { flex: 0 0 auto; padding: 3px 8px; font-size: 12px; }
+  .hotspots .scroll { overflow-x: auto; }
+  .hotspots table { min-width: 780px; }
+  .hotspots td { vertical-align: top; }
+  .hotspots td.num, .hotspots td .sub { white-space: nowrap; }
+  .hotspots td .sub { display: block; color: var(--muted); font-size: 11px; font-family: var(--mono); }
+  .hotspots td.name .addr { font-family: var(--mono); font-size: 11px; color: var(--muted); word-break: break-all; }
+  .hotspots td.name { font-family: inherit; font-size: 13px; word-break: normal; }
+  .hotspots td button { padding: 3px 9px; font-size: 12px; }
+  .hotspots td .denied { color: var(--bad); font-size: 11px; }
   details.raw { margin-top: 28px; }
   details.raw summary { cursor: pointer; color: var(--muted); font-size: 13px; }
   details.raw pre { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
@@ -189,6 +200,23 @@
         so the LNS likely logged it as a retransmission. 3s or more later, a copy from a hotspot that already sent
         the packet is a <b>device resend</b> (the device didn't get its ACK); from a new hotspot it's a
         <b>slow hotspot</b> delivering its copy late.</div>
+    </div>
+  </section>
+
+  <h2>Hotspots <span style="text-transform:none;letter-spacing:0;font-weight:400">— every hotspot that has sent a copy</span></h2>
+  <section class="panel hotspots">
+    <div class="head" style="flex-wrap:wrap"><strong>Hotspots</strong><span class="count" id="hs-count"></span>
+      <span class="spacer" style="flex:1"></span>
+      <input id="hs-search" placeholder="search name or address" spellcheck="false" autocomplete="off" aria-label="Search hotspots">
+      <label class="count" for="hs-sort">sort</label>
+      <select id="hs-sort">
+        <option value="copies">most copies</option><option value="recent">recently seen</option>
+        <option value="late">most late</option><option value="delay">slowest</option>
+        <option value="first_seen">newest</option><option value="name">name</option>
+      </select></div>
+    <div class="body">
+      <div class="note" id="hs-note" style="margin:0 0 8px"></div>
+      <div class="scroll"><table id="hs-table"><tbody></tbody></table></div>
     </div>
   </section>
 
@@ -793,6 +821,92 @@ function renderConnections() {
     : '<tr><td class="empty">No gRPC connections since the service started.</td></tr>';
 }
 
+// ------------------------------------------------------------ hotspots
+
+const HS_SORT_KEY = "mb_hs_sort";
+let hsSort = "copies";
+try { hsSort = localStorage.getItem(HS_SORT_KEY) || "copies"; } catch (_) {}
+let hsSearchTimer = null;
+
+async function loadHotspots() {
+  const params = new URLSearchParams({ sort: hsSort, limit: "200" });
+  const q = $("hs-search").value.trim();
+  if (q) params.set("q", q);
+  renderHotspots(await apiJson("/api/v1/hotspots?" + params));
+}
+
+const pct = (part, whole) => whole ? Math.round((part / whole) * 100) + "%" : "–";
+
+function renderHotspots(data) {
+  $("hs-count").textContent = data.matched === data.total
+    ? fmt(data.total) + " tracked"
+    : fmt(data.matched) + " of " + fmt(data.total) + " match";
+  const note = $("hs-note");
+  if (data.persistent) {
+    note.className = "note";
+    note.textContent = "Saved to " + data.store + " every minute and on shutdown; hotspots unseen for " +
+      data.retention_days + " days are dropped. Counts are since each hotspot was first seen; \"last hr\" restarts with the service.";
+  } else {
+    note.className = "note warn";
+    note.textContent = "hotspot_store is unset, so these stats are in memory only and reset on restart.";
+  }
+  const tbody = $("hs-table").querySelector("tbody");
+  if (!data.hotspots.length) {
+    tbody.innerHTML = '<tr><td class="empty">' + (data.total ? "No hotspots match." : "No hotspots yet.") + "</td></tr>";
+    return;
+  }
+  const head = "<tr><th>Hotspot</th><th style=\"text-align:right\">Copies</th><th style=\"text-align:right\">Arrived first</th>" +
+    "<th style=\"text-align:right\">Avg delay</th><th style=\"text-align:right\">Late · slow · resent</th>" +
+    "<th>Regions</th><th>Last seen</th><th></th></tr>";
+  tbody.innerHTML = head + data.hotspots.map((h) => {
+    const raced = h.first + h.second + h.later;
+    const action = h.denied_now
+      ? '<span class="denied">denied</span><br><button class="ghost" data-allow="' + h.address + '">Allow</button>'
+      : '<button class="ghost" data-deny="' + h.address + '">Deny</button>';
+    return '<tr><td class="name"><div>' + (h.name || "–") + '</div><div class="addr">' + h.address + "</div>" +
+      (h.denied ? '<span class="sub">' + fmt(h.denied) + " denied</span>" : "") + "</td>" +
+      '<td class="num">' + fmt(h.copies) + '<span class="sub">' + fmt(h.copies_last_hour) + " last hr</span></td>" +
+      '<td class="num">' + pct(h.first, raced) + '<span class="sub">' + fmt(h.first) + " · " + fmt(h.second) +
+        " · " + fmt(h.later) + "</span></td>" +
+      '<td class="num">' + (h.mean_delay_ms === null || h.mean_delay_ms === undefined ? "–" : fmt(h.mean_delay_ms, 0) + " ms") + "</td>" +
+      '<td class="num">' + fmt(h.late) + " · " + fmt(h.slow) + " · " + fmt(h.resends) +
+        (h.last_late ? '<span class="sub">' + agoText(h.last_late) + "</span>" : "") + "</td>" +
+      "<td>" + h.regions.join(", ") + "</td>" +
+      "<td>" + agoText(h.last_seen) + '<span class="sub">first ' + new Date(h.first_seen * 1000).toLocaleDateString() + "</span></td>" +
+      "<td>" + action + "</td></tr>";
+  }).join("");
+  tbody.querySelectorAll("button[data-deny]").forEach((b) => { b.onclick = () => denyHotspot(b.dataset.deny); });
+  tbody.querySelectorAll("button[data-allow]").forEach((b) => {
+    b.onclick = async () => { await removeEntry("hotspot", b.dataset.allow); loadHotspots().catch(() => {}); };
+  });
+}
+
+// Denying drops every copy this hotspot sends from the next request on, so ask.
+async function denyHotspot(address) {
+  if (!window.confirm("Deny " + address + "?\n\nIts copies will be refused from the next request.")) return;
+  try {
+    const result = await apiJson("/api/v1/deny-list/hotspots", {
+      method: "POST", body: JSON.stringify({ hotspots: [address] }),
+    });
+    reportMutation(result, "Denied");
+    await loadDenyLists();
+    await loadHotspots();
+  } catch (e) {
+    toast(e.message, "err");
+  }
+}
+
+$("hs-sort").value = hsSort;
+$("hs-sort").onchange = (e) => {
+  hsSort = e.target.value;
+  try { localStorage.setItem(HS_SORT_KEY, hsSort); } catch (_) {}
+  loadHotspots().catch((err) => toast(err.message, "err"));
+};
+$("hs-search").addEventListener("input", () => {
+  clearTimeout(hsSearchTimer);
+  hsSearchTimer = setTimeout(() => loadHotspots().catch((err) => toast(err.message, "err")), 250);
+});
+
 $("range-select").value = String(range);
 $("range-select").onchange = (e) => {
   range = parseInt(e.target.value, 10);
@@ -839,6 +953,7 @@ async function refresh() {
     }
 
     await loadTraffic();
+    await loadHotspots();
     await loadDenyLists();
 
     $("dot").className = "dot live";

@@ -13,6 +13,7 @@ As packets come in to HPR A and HPR B, they will check in with Multi-Buy service
 - Distributed packet counter across load-balanced HPR instances
 - Hotspot and region deny lists, editable at runtime over HTTP and persisted across restarts
 - Per-entry denial counts, so you can see which rules are actually firing
+- Per-hotspot stats (copies, arrival order, delay, late copies), saved across restarts
 - Admin API + metrics dashboard, with Angry Purple Tiger animal names for hotspots
 - Prometheus metrics endpoint
 - Automatic cache cleanup (configurable, default 30 minutes)
@@ -69,7 +70,7 @@ cargo nextest run
 ```bash
 docker build -t multibuy-service .
 
-# -v keeps deny-list changes across container replacement
+# -v keeps deny-list changes and hotspot stats across container replacement
 docker run -p 6080:6080 -p 6081:6081 -p 19011:19011 \
   -v multibuy-data:/app/data multibuy-service
 ```
@@ -98,6 +99,10 @@ grpc_listen = "0.0.0.0:6080"
 # Where admin API deny-list changes are persisted; "" = in memory only
 # Env: MB__DENY_LIST_STORE
 # deny_list_store = "deny-list.json"
+
+# Per-hotspot stats, saved every minute and on shutdown ("" = memory only)
+# Env: MB__HOTSPOT_STORE
+# hotspot_store = "hotspots.json"
 
 # Prometheus metrics endpoint
 [metrics]
@@ -139,6 +144,7 @@ listen = "0.0.0.0:6081"
 | `MB__API__LISTEN` | Admin API / dashboard listen address | `0.0.0.0:6081` |
 | `MB__API__AUTH_TOKEN` | Bearer token required on API requests | unset (no auth) |
 | `MB__DENY_LIST_STORE` | Where API deny-list changes are persisted (`""` disables) | `deny-list.json` |
+| `MB__HOTSPOT_STORE` | Where per-hotspot stats are saved (`""` disables) | `hotspots.json` |
 
 ## Metrics
 
@@ -242,6 +248,7 @@ token is configured. `/` and `/health` are always open.
 | `GET` | `/api/v1/info` | Version, listen addresses, uptime |
 | `GET` | `/api/v1/metrics` | Prometheus payload, rendered in-process |
 | `GET` | `/api/v1/traffic?min_gap=10` | Requests per second for the last hour, runs of `min_gap`+ seconds with none (e.g. HPR backing off), copies arriving after the LNS dedup window, device resends and slow-hotspot copies (3s+), requests per HPR address, and the hotspots delivering late |
+| `GET` | `/api/v1/hotspots?sort=copies&q=&limit=100` | Every hotspot seen, with copies, arrival position, delay, late/slow/resend counts, denials and regions. `sort`: copies, recent, late, delay, first_seen, name |
 | `GET` | `/api/v1/connections` | gRPC client connects/disconnects, with how long each was open and why it closed |
 | `GET` | `/api/v1/regions` | Every region name the proto accepts |
 | `GET` | `/api/v1/animal-name/{key}` | Animal name for an address, without changing anything |

@@ -26,14 +26,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// How many seconds of history are kept.
 pub const WINDOW_SECS: u64 = 3600;
 
-/// A ring of one-second slots, indexed by `unix_second % WINDOW_SECS`.
+/// A ring of time slots, indexed by `unit % len`. The unit is the caller's:
+/// traffic records unix seconds over an hour ([`WINDOW_SECS`] slots), hotspots
+/// record unix minutes over an hour (60 slots).
 ///
 /// Each slot packs the second it describes into the high 32 bits and that
 /// second's request count into the low 32, so a slot left over from a previous
 /// lap of the ring is recognisable (its second is stale) and reads as zero.
 /// Recording is one CAS on the request path; there is no lock and no
 /// background task.
-pub struct PerSecond {
+pub struct Ring {
     slots: Box<[AtomicU64]>,
     /// Unix seconds when recording began. Earlier seconds are unknown, not
     /// silent, so they are never reported.
@@ -71,10 +73,6 @@ fn unpack(slot: u64) -> (u64, u32) {
 /// copies normally land well inside that.
 pub const REPEAT_AFTER: Duration = Duration::from_secs(3);
 
-/// Most hotspots tracked for late-copy attribution. The hotspots that hear one
-/// operator's devices number in the tens; the cap only guards memory.
-const MAX_HOTSPOTS: usize = 2_000;
-
 /// Most HPR client addresses tracked for per-HPR traffic.
 const MAX_PEERS: usize = 32;
 
@@ -110,51 +108,34 @@ impl Arrival {
     }
 }
 
-/// Late arrivals attributed to one hotspot.
-#[derive(Debug, Default)]
-pub struct HotspotTiming {
-    /// Copies after the dedup window but under [`REPEAT_AFTER`].
-    pub late: AtomicU64,
-    /// Copies [`REPEAT_AFTER`] or more after the first, from this hotspot's
-    /// first copy of the packet.
-    pub slow: AtomicU64,
-    /// The packet again from this hotspot after it had already sent it.
-    pub resends: AtomicU64,
-    /// Unix seconds of the most recent of any of the above.
-    pub last: AtomicU64,
-}
-
 /// Per-second history of all requests, the late arrivals among them, and which
-/// hotspots and HPR instances they came from.
+/// HPR instances they came from.
 pub struct Traffic {
-    pub requests: PerSecond,
-    pub late: PerSecond,
-    pub resends: PerSecond,
-    pub slow_copies: PerSecond,
+    pub requests: Ring,
+    pub late: Ring,
+    pub resends: Ring,
+    pub slow_copies: Ring,
     pub dedup_window: Duration,
-    /// Keyed by the hotspot's b58 address.
-    pub hotspots: DashMap<String, HotspotTiming>,
     /// Requests per HPR client IP. Keyed by IP rather than connection so an HPR
     /// keeps one history across reconnects.
-    pub peers: DashMap<IpAddr, PerSecond>,
+    pub peers: DashMap<IpAddr, Ring>,
 }
 
 impl Traffic {
     pub fn new(dedup_window: Duration) -> Self {
         Self {
-            requests: PerSecond::new(),
-            late: PerSecond::new(),
-            resends: PerSecond::new(),
-            slow_copies: PerSecond::new(),
+            requests: Ring::new(),
+            late: Ring::new(),
+            resends: Ring::new(),
+            slow_copies: Ring::new(),
             dedup_window,
-            hotspots: DashMap::new(),
             peers: DashMap::new(),
         }
     }
 
-    /// Record one request: what the cache knew about its packet, the hotspot
-    /// that heard it, and the HPR that sent it.
-    pub fn record(&self, seen: &Seen, hotspot: &str, peer: Option<IpAddr>) -> Arrival {
+    /// Record one request, given what the cache knew about its packet and the
+    /// HPR that sent it. Returns how it was classified.
+    pub fn record(&self, seen: &Seen, peer: Option<IpAddr>) -> Arrival {
         let second = now_unix();
         self.requests.record_at(second);
         if let Some(ip) = peer {
@@ -170,7 +151,6 @@ impl Traffic {
         };
         if let Some(series) = series {
             series.record_at(second);
-            self.record_hotspot(hotspot, arrival, second);
         }
         if let (Some(delay), Arrival::OnTime | Arrival::Late) = (seen.since_first, arrival) {
             crate::metrics::record_copy_delay(delay);
@@ -187,53 +167,41 @@ impl Traffic {
             self.peers.entry(ip).or_default().record_at(second);
         }
     }
-
-    fn record_hotspot(&self, hotspot: &str, arrival: Arrival, second: u64) {
-        if hotspot.is_empty() {
-            return;
-        }
-        let bump = |timing: &HotspotTiming| {
-            let counter = match arrival {
-                Arrival::Late => &timing.late,
-                Arrival::SlowCopy => &timing.slow,
-                _ => &timing.resends,
-            };
-            counter.fetch_add(1, Ordering::Relaxed);
-            timing.last.store(second, Ordering::Relaxed);
-        };
-        if let Some(timing) = self.hotspots.get(hotspot) {
-            bump(&timing);
-            return;
-        }
-        if self.hotspots.len() < MAX_HOTSPOTS {
-            bump(&self.hotspots.entry(hotspot.to_string()).or_default());
-        }
-    }
 }
 
-fn now_unix() -> u64 {
+pub(crate) fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
 }
 
-impl Default for PerSecond {
+impl Default for Ring {
     fn default() -> Self {
         Self::starting_at(now_unix())
     }
 }
 
-impl PerSecond {
+impl Ring {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// A recorder whose history begins at `started_at` (unix seconds).
+    /// A per-second, one-hour recorder whose history begins at `started_at`
+    /// (unix seconds).
     pub fn starting_at(started_at: u64) -> Self {
+        Self::with_len(WINDOW_SECS, started_at)
+    }
+
+    /// A recorder of `len` slots whose history begins at unit `started_at`.
+    pub fn with_len(len: u64, started_at: u64) -> Self {
         Self {
-            slots: (0..WINDOW_SECS).map(|_| AtomicU64::new(0)).collect(),
+            slots: (0..len).map(|_| AtomicU64::new(0)).collect(),
             started_at,
         }
+    }
+
+    fn len(&self) -> u64 {
+        self.slots.len() as u64
     }
 
     /// Count one request now.
@@ -243,7 +211,7 @@ impl PerSecond {
 
     /// Count one request in the given unix second.
     pub fn record_at(&self, second: u64) {
-        let slot = &self.slots[(second % WINDOW_SECS) as usize];
+        let slot = &self.slots[(second % self.len()) as usize];
         let mut current = slot.load(Ordering::Relaxed);
         loop {
             let (held, count) = unpack(current);
@@ -272,11 +240,11 @@ impl PerSecond {
     /// Counts for the window ending at `now` (inclusive), clipped to when
     /// recording began.
     pub fn snapshot_at(&self, now: u64) -> Snapshot {
-        let start = (now + 1).saturating_sub(WINDOW_SECS).max(self.started_at);
+        let start = (now + 1).saturating_sub(self.len()).max(self.started_at);
         let counts = (start..=now)
             .map(|second| {
                 let (held, count) =
-                    unpack(self.slots[(second % WINDOW_SECS) as usize].load(Ordering::Relaxed));
+                    unpack(self.slots[(second % self.len()) as usize].load(Ordering::Relaxed));
                 if held == second {
                     count
                 } else {
@@ -370,8 +338,8 @@ mod tests {
 
     const T0: u64 = 1_800_000_000;
 
-    fn recorded(seconds: &[u64]) -> PerSecond {
-        let traffic = PerSecond::starting_at(T0);
+    fn recorded(seconds: &[u64]) -> Ring {
+        let traffic = Ring::starting_at(T0);
         for &s in seconds {
             traffic.record_at(s);
         }
@@ -407,42 +375,30 @@ mod tests {
     }
 
     #[test]
-    fn repeats_are_attributed_to_their_hotspot() {
+    fn late_arrivals_are_counted_in_their_series() {
         let traffic = Traffic::new(Duration::from_millis(200));
         let seen = |ms, same_hotspot| Seen {
             count: 2,
             since_first: Some(Duration::from_millis(ms)),
             same_hotspot,
         };
-        assert_eq!(
-            traffic.record(&seen(500, false), "hs-a", None),
-            Arrival::Late
-        );
-        assert_eq!(
-            traffic.record(&seen(4_000, false), "hs-b", None),
-            Arrival::SlowCopy
-        );
-        assert_eq!(
-            traffic.record(&seen(9_000, true), "hs-b", None),
-            Arrival::Resend
-        );
-        assert_eq!(
-            traffic.record(&seen(10, false), "hs-c", None),
-            Arrival::OnTime
-        );
+        assert_eq!(traffic.record(&seen(500, false), None), Arrival::Late);
+        assert_eq!(traffic.record(&seen(4_000, false), None), Arrival::SlowCopy);
+        assert_eq!(traffic.record(&seen(9_000, true), None), Arrival::Resend);
+        assert_eq!(traffic.record(&seen(10, false), None), Arrival::OnTime);
+        assert_eq!(traffic.late.snapshot().total(), 1);
+        assert_eq!(traffic.slow_copies.snapshot().total(), 1);
+        assert_eq!(traffic.resends.snapshot().total(), 1);
+        assert_eq!(traffic.requests.snapshot().total(), 4);
+    }
 
-        let get = |h: &str| {
-            let t = traffic.hotspots.get(h).unwrap();
-            (
-                t.late.load(Ordering::Relaxed),
-                t.slow.load(Ordering::Relaxed),
-                t.resends.load(Ordering::Relaxed),
-            )
-        };
-        assert_eq!(get("hs-a"), (1, 0, 0));
-        assert_eq!(get("hs-b"), (0, 1, 1));
-        // On-time copies aren't attributed to anyone.
-        assert!(traffic.hotspots.get("hs-c").is_none());
+    #[test]
+    fn a_short_ring_wraps_at_its_own_length() {
+        let ring = Ring::with_len(60, 100);
+        ring.record_at(100);
+        ring.record_at(159);
+        ring.record_at(160); // same slot as 100, one lap on
+        assert_eq!(ring.snapshot_at(160).total(), 2);
     }
 
     #[test]
@@ -455,10 +411,10 @@ mod tests {
         };
         let a: IpAddr = "10.0.0.1".parse().unwrap();
         let b: IpAddr = "10.0.0.2".parse().unwrap();
-        traffic.record(&first, "", Some(a));
-        traffic.record(&first, "", Some(a));
-        traffic.record(&first, "", Some(b));
-        traffic.record(&first, "", None);
+        traffic.record(&first, Some(a));
+        traffic.record(&first, Some(a));
+        traffic.record(&first, Some(b));
+        traffic.record(&first, None);
         let total = |ip| traffic.peers.get(&ip).unwrap().snapshot().total();
         assert_eq!(total(a), 2);
         assert_eq!(total(b), 1);
@@ -547,7 +503,7 @@ mod tests {
 
     #[test]
     fn concurrent_records_are_all_counted() {
-        let traffic = std::sync::Arc::new(PerSecond::starting_at(T0));
+        let traffic = std::sync::Arc::new(Ring::starting_at(T0));
         let handles: Vec<_> = (0..8)
             .map(|_| {
                 let traffic = traffic.clone();

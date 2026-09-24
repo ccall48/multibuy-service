@@ -22,3 +22,8 @@ settings.toml
 deny-list.json
 deny-list.json.tmp
 deny-list.corrupt
+
+# Hotspot stats persistence
+hotspots.json
+hotspots.json.tmp
+hotspots.corrupt

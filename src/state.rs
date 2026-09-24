@@ -1,6 +1,7 @@
 use crate::cache::Cache;
 use crate::connections::Connections;
 use crate::deny_lists::{DenyListStore, DenyLists};
+use crate::hotspots::{HotspotStore, Hotspots};
 use crate::settings::Settings;
 use crate::traffic::Traffic;
 use helium_proto::services::multi_buy::{multi_buy_server, MultiBuyIncReqV1, MultiBuyIncResV1};
@@ -13,6 +14,7 @@ pub struct State {
     store: Arc<DenyListStore>,
     traffic: Arc<Traffic>,
     connections: Arc<Connections>,
+    hotspots: Arc<Hotspots>,
 }
 
 impl State {
@@ -68,6 +70,7 @@ impl State {
             store: Arc::new(store),
             traffic: Arc::new(Traffic::new(settings.lns_dedup_window)),
             connections: Arc::new(Connections::new()),
+            hotspots: Arc::new(Hotspots::load(HotspotStore::new(&settings.hotspot_store))),
         })
     }
 
@@ -97,6 +100,12 @@ impl State {
     pub fn connections(&self) -> Arc<Connections> {
         self.connections.clone()
     }
+
+    /// Per-hotspot stats, shared with the admin API and the task that saves
+    /// them to disk.
+    pub fn hotspots(&self) -> Arc<Hotspots> {
+        self.hotspots.clone()
+    }
 }
 
 #[tonic::async_trait]
@@ -119,7 +128,9 @@ impl multi_buy_server::MultiBuy for State {
             .inc(multi_buy_req.key.clone(), &multi_buy_req.hotspot_key);
         let count = seen.count;
         let hotspot = String::from_utf8_lossy(&multi_buy_req.hotspot_key).into_owned();
-        self.traffic.record(&seen, &hotspot, peer);
+        let arrival = self.traffic.record(&seen, peer);
+        self.hotspots
+            .record(&hotspot, &seen, arrival, multi_buy_req.region, denied);
         // The proto region is an integer; log the name so a denial is readable
         // without a lookup table.
         let region = crate::deny_lists::region_label(multi_buy_req.region);
