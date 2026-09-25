@@ -53,3 +53,13 @@ listen = "0.0.0.0:6081"
 # trusted operators can reach.
 # Env: MB__API__AUTH_TOKEN
 # auth_token = "change-me"
+
+# Names for HPR addresses, shown on the dashboard instead of the IP. Names set
+# on the dashboard override these; resetting one there falls back to these.
+# Helium's HPRs currently run in AWS at:
+[hpr_labels]
+"3.69.232.10" = "Frankfurt"
+"3.72.47.84" = "Frankfurt"
+"18.236.140.3" = "Portland"
+"44.245.6.101" = "Portland"
+"13.214.211.194" = "Singapore"

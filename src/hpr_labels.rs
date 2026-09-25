@@ -4,6 +4,10 @@
 //! location, but an operator usually knows better — and a name like "EU-1" may
 //! be more useful than a city anyway. Labels are few and change rarely, so the
 //! whole map is written to disk on every change.
+//!
+//! Names can also come from settings (`hpr_labels`). Those are the baseline:
+//! a name saved from the dashboard overrides one, and removing the saved name
+//! falls back to it. Only saved names are written to disk.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -54,14 +58,25 @@ fn clean_label(label: &str) -> anyhow::Result<String> {
 
 #[derive(Debug, Default)]
 pub struct HprLabels {
+    /// Names saved from the dashboard.
     labels: RwLock<BTreeMap<String, String>>,
+    /// Names from settings, canonicalised.
+    configured: BTreeMap<String, String>,
     path: Option<PathBuf>,
 }
 
 impl HprLabels {
-    /// Load labels from `path`; an empty path keeps them in memory only. A
-    /// missing file starts empty; a bad one is moved aside and reported.
-    pub fn load(path: &Path) -> Self {
+    /// Load saved labels from `path` over the `configured` ones from settings.
+    /// An empty path keeps saved labels in memory only. A missing file starts
+    /// empty; a bad one is moved aside and reported. An invalid configured
+    /// entry is an error, so a typo in settings fails loudly at startup.
+    pub fn load(path: &Path, configured: &BTreeMap<String, String>) -> anyhow::Result<Self> {
+        let configured = configured
+            .iter()
+            .map(|(ip, label)| {
+                validate(ip, label).map_err(|e| anyhow::anyhow!("hpr_labels entry '{ip}': {e}"))
+            })
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
         let path = (!path.as_os_str().is_empty()).then(|| path.to_path_buf());
         let labels = match &path {
             None => {
@@ -83,10 +98,11 @@ impl HprLabels {
                 }
             },
         };
-        Self {
+        Ok(Self {
             labels: RwLock::new(labels),
+            configured,
             path,
-        }
+        })
     }
 
     pub fn in_memory() -> Self {
@@ -97,7 +113,20 @@ impl HprLabels {
         self.path.is_some()
     }
 
+    /// Every name in effect: configured ones, overridden by saved ones.
     pub fn all(&self) -> BTreeMap<String, String> {
+        let mut all = self.configured.clone();
+        all.extend(self.saved());
+        all
+    }
+
+    /// Names from settings.
+    pub fn configured(&self) -> BTreeMap<String, String> {
+        self.configured.clone()
+    }
+
+    /// Names saved from the dashboard.
+    pub fn saved(&self) -> BTreeMap<String, String> {
         self.read_lock().clone()
     }
 
@@ -114,7 +143,8 @@ impl HprLabels {
         self.save(&snapshot)
     }
 
-    /// Remove the label for `ip`. Returns whether there was one.
+    /// Remove the saved label for `ip`, falling back to any configured one.
+    /// Returns whether there was a saved label.
     pub fn remove(&self, ip: &str) -> anyhow::Result<bool> {
         let ip = canonical_ip(ip)?;
         let (removed, snapshot) = {
@@ -202,6 +232,30 @@ mod tests {
     }
 
     #[test]
+    fn saved_names_override_configured_ones_until_removed() {
+        let configured = BTreeMap::from([("3.69.232.10".to_string(), "Frankfurt".to_string())]);
+        let labels = HprLabels::load(Path::new(""), &configured).unwrap();
+        assert_eq!(labels.all()["3.69.232.10"], "Frankfurt");
+
+        labels.set("3.69.232.10", "EU-1").unwrap();
+        assert_eq!(labels.all()["3.69.232.10"], "EU-1");
+        assert_eq!(labels.configured()["3.69.232.10"], "Frankfurt");
+
+        assert!(labels.remove("3.69.232.10").unwrap());
+        assert_eq!(labels.all()["3.69.232.10"], "Frankfurt");
+        // Nothing saved left to remove; the configured name stays.
+        assert!(!labels.remove("3.69.232.10").unwrap());
+        assert_eq!(labels.all()["3.69.232.10"], "Frankfurt");
+    }
+
+    #[test]
+    fn invalid_configured_entry_is_an_error() {
+        let bad = BTreeMap::from([("not-an-ip".to_string(), "x".to_string())]);
+        let err = HprLabels::load(Path::new(""), &bad).unwrap_err();
+        assert!(err.to_string().contains("not-an-ip"), "{err}");
+    }
+
+    #[test]
     fn ipv4_mapped_addresses_share_a_label() {
         let labels = HprLabels::in_memory();
         labels.set("::ffff:18.236.140.3", "Portland").unwrap();
@@ -223,9 +277,9 @@ mod tests {
     #[test]
     fn labels_survive_a_reload() {
         let path = temp_path("reload");
-        let labels = HprLabels::load(&path);
+        let labels = HprLabels::load(&path, &BTreeMap::new()).unwrap();
         labels.set("44.245.6.101", "Singapore").unwrap();
-        let reloaded = HprLabels::load(&path);
+        let reloaded = HprLabels::load(&path, &BTreeMap::new()).unwrap();
         assert_eq!(reloaded.all()["44.245.6.101"], "Singapore");
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
@@ -235,7 +289,7 @@ mod tests {
         let path = temp_path("corrupt");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "nope").unwrap();
-        let labels = HprLabels::load(&path);
+        let labels = HprLabels::load(&path, &BTreeMap::new()).unwrap();
         assert!(labels.all().is_empty());
         assert!(path.with_extension("corrupt").exists());
         std::fs::remove_dir_all(path.parent().unwrap()).ok();

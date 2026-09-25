@@ -469,14 +469,20 @@ async fn get_hotspot_stats(
 
 #[derive(Serialize)]
 struct HprLabelsView {
-    /// Canonical IP -> label.
+    /// Canonical IP -> the name in effect.
     labels: std::collections::BTreeMap<String, String>,
+    /// Names from settings (`hpr_labels`).
+    configured: std::collections::BTreeMap<String, String>,
+    /// Names saved from the dashboard, which override configured ones.
+    saved: std::collections::BTreeMap<String, String>,
     persistent: bool,
 }
 
 fn hpr_labels_view(labels: &HprLabels) -> Json<HprLabelsView> {
     Json(HprLabelsView {
         labels: labels.all(),
+        configured: labels.configured(),
+        saved: labels.saved(),
         persistent: labels.is_persistent(),
     })
 }

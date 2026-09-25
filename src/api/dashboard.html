@@ -619,6 +619,12 @@ function hprText(peer) {
   return hprName(ip) + (shownIps.has(ip) ? " · " + peer : "");
 }
 
+function setHprLabels(view) {
+  hprLabels = view.labels || {};
+  hprConfigured = view.configured || {};
+  hprSaved = view.saved || {};
+}
+
 // An operator's name wins; ipinfo.io is only asked about unnamed HPRs.
 const hprName = (ip) => hprLabels[ip] || geoLabel(ip);
 
@@ -634,13 +640,17 @@ function renderHprs() {
   }
   tbody.innerHTML = '<tr><th>HPR</th><th style="text-align:right">Requests, last hour</th><th>Address</th><th></th></tr>' +
     ips.map((ip) => {
-      const named = Object.prototype.hasOwnProperty.call(hprLabels, ip);
+      const has = (m) => Object.prototype.hasOwnProperty.call(m, ip);
+      const named = has(hprLabels), saved = has(hprSaved), configured = has(hprConfigured);
+      const source = saved ? (configured ? "set here · settings say “" + hprConfigured[ip] + "”" : "set here")
+        : configured ? "from settings" : isPrivateIp(ip) ? "" : "location from ipinfo.io";
       return "<tr><td>" + esc(hprName(ip)) +
-        (named || isPrivateIp(ip) ? "" : '<span class="sub" style="display:block;color:var(--muted);font-size:11px">location from ipinfo.io</span>') +
+        (source ? '<span class="sub" style="display:block;color:var(--muted);font-size:11px">' + esc(source) + "</span>" : "") +
         '</td><td class="num">' + fmt(seen.get(ip) || 0) + '</td><td class="peer">' +
         (shownIps.has(ip) ? esc(ip) + " " : "") + hprReveal(ip) + "</td><td>" +
         '<button type="button" class="ghost" data-hpr-name="' + esc(ip) + '">' + (named ? "Rename" : "Name") + "</button>" +
-        (named ? ' <button type="button" class="ghost" data-hpr-clear="' + esc(ip) + '">Clear</button>' : "") +
+        (saved ? ' <button type="button" class="ghost" data-hpr-clear="' + esc(ip) + '">' +
+          (configured ? "Reset" : "Clear") + "</button>" : "") +
         "</td></tr>";
     }).join("");
 }
@@ -652,8 +662,10 @@ async function saveHprLabel(ip, label) {
       : await apiJson("/api/v1/hpr-labels/" + encodeURIComponent(ip), {
           method: "PUT", body: JSON.stringify({ label }),
         });
-    hprLabels = res.labels || {};
-    toast(label === null ? "Name cleared." : "Saved “" + label.trim() + "”.", "ok");
+    setHprLabels(res);
+    toast(label === null
+      ? (hprConfigured[ip] ? "Back to “" + hprConfigured[ip] + "” from settings." : "Name cleared.")
+      : "Saved “" + label.trim() + "”.", "ok");
     if (!res.persistent) toast("hpr_label_store is unset, so names are lost on restart.", "err");
     renderTraffic();
   } catch (e) {
@@ -670,7 +682,12 @@ document.addEventListener("click", (e) => {
   const name = e.target.closest("[data-hpr-name]");
   if (name) return promptHprName(name.dataset.hprName);
   const clear = e.target.closest("[data-hpr-clear]");
-  if (clear && window.confirm("Clear the name for this HPR?")) saveHprLabel(clear.dataset.hprClear, null);
+  if (!clear) return;
+  const ip = clear.dataset.hprClear;
+  const question = hprConfigured[ip]
+    ? "Go back to the name from settings, “" + hprConfigured[ip] + "”?"
+    : "Clear the name for this HPR?";
+  if (window.confirm(question)) saveHprLabel(ip, null);
 });
 
 function hprReveal(peer) {
@@ -803,7 +820,9 @@ let minGap = 10;
 try { minGap = parseInt(localStorage.getItem(GAP_KEY), 10) || 10; } catch (_) {}
 let traffic = null;
 let conns = null;
-let hprLabels = {};   // canonical IP -> operator-given name
+let hprLabels = {};   // canonical IP -> name in effect
+let hprConfigured = {};   // names from settings
+let hprSaved = {};        // names saved from the dashboard (override settings)
 const RANGE_KEY = "mb_traffic_range";
 let range = 900;
 try { range = parseInt(localStorage.getItem(RANGE_KEY), 10) || 900; } catch (_) {}
@@ -823,7 +842,7 @@ async function loadTraffic() {
     apiJson("/api/v1/connections"),
     apiJson("/api/v1/hpr-labels"),
   ]);
-  hprLabels = labels.labels || {};
+  setHprLabels(labels);
   renderTraffic();
 }
 

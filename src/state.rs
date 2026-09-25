@@ -73,7 +73,10 @@ impl State {
             traffic: Arc::new(Traffic::new(settings.lns_dedup_window)),
             connections: Arc::new(Connections::new()),
             hotspots: Arc::new(Hotspots::load(HotspotStore::new(&settings.hotspot_store))),
-            hpr_labels: Arc::new(HprLabels::load(&settings.hpr_label_store)),
+            hpr_labels: Arc::new(HprLabels::load(
+                &settings.hpr_label_store,
+                &settings.hpr_labels,
+            )?),
         })
     }
 

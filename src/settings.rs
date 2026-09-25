@@ -51,6 +51,11 @@ pub struct Settings {
     /// an empty string to keep them in memory only.
     #[serde(default = "default_hpr_label_store")]
     pub hpr_label_store: PathBuf,
+    /// Default names for HPR addresses, e.g. `"3.69.232.10" = "Frankfurt"`.
+    /// Names set on the dashboard override these; clearing one there falls
+    /// back to the name here.
+    #[serde(default)]
+    pub hpr_labels: std::collections::BTreeMap<String, String>,
 }
 
 pub fn default_log() -> String {
@@ -218,6 +223,25 @@ mod tests {
             let settings = Settings::new::<String>(None).unwrap();
             assert_eq!(settings.deny_list_store, PathBuf::from(""));
         });
+    }
+
+    #[test]
+    fn hpr_labels_from_file_keep_dotted_ip_keys() {
+        let dir = std::env::temp_dir().join(format!("mb-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("settings.toml");
+        std::fs::write(
+            &file,
+            "[hpr_labels]\n\"3.69.232.10\" = \"Frankfurt\"\n\"13.214.211.194\" = \"Singapore\"\n",
+        )
+        .unwrap();
+        with_env_vars(&[], || {
+            let settings = Settings::new(Some(&file)).unwrap();
+            assert_eq!(settings.hpr_labels.len(), 2, "{:?}", settings.hpr_labels);
+            assert_eq!(settings.hpr_labels["3.69.232.10"], "Frankfurt");
+            assert_eq!(settings.hpr_labels["13.214.211.194"], "Singapore");
+        });
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

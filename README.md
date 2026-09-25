@@ -108,6 +108,10 @@ grpc_listen = "0.0.0.0:6080"
 # Env: MB__HPR_LABEL_STORE
 # hpr_label_store = "hpr-labels.json"
 
+# Default HPR names (dashboard names override these)
+# [hpr_labels]
+# "3.69.232.10" = "Frankfurt"
+
 # Prometheus metrics endpoint
 [metrics]
 # Env: MB__METRICS__ENDPOINT
