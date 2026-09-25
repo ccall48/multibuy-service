@@ -4,6 +4,7 @@ pub mod cli;
 pub mod connections;
 pub mod deny_lists;
 pub mod hotspots;
+pub mod hpr_labels;
 pub mod metrics;
 pub mod settings;
 pub mod state;

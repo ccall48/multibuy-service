@@ -47,6 +47,10 @@ pub struct Settings {
     /// Set to an empty string to keep them in memory only.
     #[serde(default = "default_hotspot_store")]
     pub hotspot_store: PathBuf,
+    /// Where names given to HPR addresses on the dashboard are saved. Set to
+    /// an empty string to keep them in memory only.
+    #[serde(default = "default_hpr_label_store")]
+    pub hpr_label_store: PathBuf,
 }
 
 pub fn default_log() -> String {
@@ -59,6 +63,10 @@ pub fn default_grpc_listen_addr() -> SocketAddr {
 
 pub fn default_deny_list_store() -> PathBuf {
     PathBuf::from("deny-list.json")
+}
+
+pub fn default_hpr_label_store() -> PathBuf {
+    PathBuf::from("hpr-labels.json")
 }
 
 pub fn default_hotspot_store() -> PathBuf {

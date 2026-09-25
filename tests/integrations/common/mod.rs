@@ -52,6 +52,7 @@ pub fn test_settings_with_cleanup(cleanup_timeout: Duration) -> Settings {
             s.cleanup_timeout = cleanup_timeout;
             s.deny_list_store = std::path::PathBuf::new();
             s.hotspot_store = std::path::PathBuf::new();
+            s.hpr_label_store = std::path::PathBuf::new();
             s
         },
     )

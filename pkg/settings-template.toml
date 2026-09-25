@@ -32,6 +32,11 @@ grpc_listen = "0.0.0.0:6080"
 # Env: MB__HOTSPOT_STORE
 # hotspot_store = "hotspots.json"
 
+# Where names given to HPR addresses on the dashboard are saved.
+# Set to "" to keep them in memory only.
+# Env: MB__HPR_LABEL_STORE
+# hpr_label_store = "hpr-labels.json"
+
 # Prometheus metrics endpoint
 [metrics]
 # Env: MB__METRICS__ENDPOINT

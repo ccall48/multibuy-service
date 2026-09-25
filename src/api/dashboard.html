@@ -229,7 +229,10 @@
       <table id="silence-table"><tbody></tbody></table>
       <h3>Hotspots delivering late <span style="font-weight:400">— since the service started</span></h3>
       <table id="late-hotspot-table"><tbody></tbody></table>
-      <h3>Connections <span style="font-weight:400">— HPR locations from ipinfo.io, looked up by this browser</span></h3>
+      <h3>HPRs <span style="font-weight:400">— your names first; unnamed ones located via ipinfo.io by this browser</span>
+        <button type="button" class="linkish" id="hpr-add" style="margin-left:8px">Name an HPR…</button></h3>
+      <table id="hpr-table"><tbody></tbody></table>
+      <h3>Connections</h3>
       <table id="conn-table"><tbody></tbody></table>
       <div class="hint">HPR stops calling this service for a route while it backs off after a failed request
         (1s, doubling to 5 min). With <code>fail_on_unavailable</code> on, it drops those packets, so they
@@ -613,8 +616,62 @@ async function lookupGeo(ip) {
 // How an HPR is named on the page: its location, plus the IP once revealed.
 function hprText(peer) {
   const ip = bareIp(peer);
-  return geoLabel(ip) + (shownIps.has(ip) ? " · " + peer : "");
+  return hprName(ip) + (shownIps.has(ip) ? " · " + peer : "");
 }
+
+// An operator's name wins; ipinfo.io is only asked about unnamed HPRs.
+const hprName = (ip) => hprLabels[ip] || geoLabel(ip);
+
+// HPRs seen in the last hour plus any that have a name, busiest first.
+function renderHprs() {
+  const tbody = $("hpr-table").querySelector("tbody");
+  const seen = new Map((traffic && traffic.peers || []).map((p) => [bareIp(p.ip), p.total]));
+  const ips = [...new Set([...seen.keys(), ...Object.keys(hprLabels)])]
+    .sort((a, b) => (seen.get(b) || 0) - (seen.get(a) || 0) || a.localeCompare(b));
+  if (!ips.length) {
+    tbody.innerHTML = '<tr><td class="empty">No HPRs in the last hour.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = '<tr><th>HPR</th><th style="text-align:right">Requests, last hour</th><th>Address</th><th></th></tr>' +
+    ips.map((ip) => {
+      const named = Object.prototype.hasOwnProperty.call(hprLabels, ip);
+      return "<tr><td>" + esc(hprName(ip)) +
+        (named || isPrivateIp(ip) ? "" : '<span class="sub" style="display:block;color:var(--muted);font-size:11px">location from ipinfo.io</span>') +
+        '</td><td class="num">' + fmt(seen.get(ip) || 0) + '</td><td class="peer">' +
+        (shownIps.has(ip) ? esc(ip) + " " : "") + hprReveal(ip) + "</td><td>" +
+        '<button type="button" class="ghost" data-hpr-name="' + esc(ip) + '">' + (named ? "Rename" : "Name") + "</button>" +
+        (named ? ' <button type="button" class="ghost" data-hpr-clear="' + esc(ip) + '">Clear</button>' : "") +
+        "</td></tr>";
+    }).join("");
+}
+
+async function saveHprLabel(ip, label) {
+  try {
+    const res = label === null
+      ? await apiJson("/api/v1/hpr-labels/" + encodeURIComponent(ip), { method: "DELETE" })
+      : await apiJson("/api/v1/hpr-labels/" + encodeURIComponent(ip), {
+          method: "PUT", body: JSON.stringify({ label }),
+        });
+    hprLabels = res.labels || {};
+    toast(label === null ? "Name cleared." : "Saved “" + label.trim() + "”.", "ok");
+    if (!res.persistent) toast("hpr_label_store is unset, so names are lost on restart.", "err");
+    renderTraffic();
+  } catch (e) {
+    toast(e.message, "err");
+  }
+}
+
+function promptHprName(ip) {
+  const label = window.prompt("Name for HPR " + ip + " (e.g. Frankfurt):", hprLabels[ip] || "");
+  if (label !== null && label.trim()) saveHprLabel(ip, label);
+}
+
+document.addEventListener("click", (e) => {
+  const name = e.target.closest("[data-hpr-name]");
+  if (name) return promptHprName(name.dataset.hprName);
+  const clear = e.target.closest("[data-hpr-clear]");
+  if (clear && window.confirm("Clear the name for this HPR?")) saveHprLabel(clear.dataset.hprClear, null);
+});
 
 function hprReveal(peer) {
   const ip = bareIp(peer);
@@ -746,6 +803,7 @@ let minGap = 10;
 try { minGap = parseInt(localStorage.getItem(GAP_KEY), 10) || 10; } catch (_) {}
 let traffic = null;
 let conns = null;
+let hprLabels = {};   // canonical IP -> operator-given name
 const RANGE_KEY = "mb_traffic_range";
 let range = 900;
 try { range = parseInt(localStorage.getItem(RANGE_KEY), 10) || 900; } catch (_) {}
@@ -759,10 +817,13 @@ function durationText(seconds) {
 }
 
 async function loadTraffic() {
-  [traffic, conns] = await Promise.all([
+  let labels;
+  [traffic, conns, labels] = await Promise.all([
     apiJson("/api/v1/traffic?min_gap=" + minGap),
     apiJson("/api/v1/connections"),
+    apiJson("/api/v1/hpr-labels"),
   ]);
+  hprLabels = labels.labels || {};
   renderTraffic();
 }
 
@@ -923,6 +984,7 @@ function renderTraffic() {
     fmt(slowRow.total) + " slow hotspot";
   renderLateHotspots();
   renderConnections();
+  renderHprs();
   const rows = t.silences.slice().reverse().map((g) =>
     "<tr><td>" + clock(g.start) + "</td><td class=\"num\">" + durationText(g.seconds) + "</td><td>" +
     (g.ongoing ? '<span class="badge">ongoing</span>' : clock(g.start + g.seconds)) + "</td></tr>");
@@ -1065,6 +1127,11 @@ $("hs-search").addEventListener("input", () => {
   clearTimeout(hsSearchTimer);
   hsSearchTimer = setTimeout(() => loadHotspots().catch((err) => toast(err.message, "err")), 250);
 });
+
+$("hpr-add").onclick = () => {
+  const ip = window.prompt("HPR IP address to name:");
+  if (ip && ip.trim()) promptHprName(ip.trim());
+};
 
 $("range-select").value = String(range);
 $("range-select").onchange = (e) => {

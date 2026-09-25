@@ -42,6 +42,8 @@ COPY pkg/settings-template.toml /app/config/settings.toml
 ENV MB__DENY_LIST_STORE=/app/data/deny-list.json
 # Per-hotspot stats, saved every minute and on shutdown.
 ENV MB__HOTSPOT_STORE=/app/data/hotspots.json
+# Names given to HPR addresses on the dashboard.
+ENV MB__HPR_LABEL_STORE=/app/data/hpr-labels.json
 VOLUME /app/data
 
 EXPOSE 6080 6081 19011

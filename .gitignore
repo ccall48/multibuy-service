@@ -27,3 +27,8 @@ deny-list.corrupt
 hotspots.json
 hotspots.json.tmp
 hotspots.corrupt
+
+# HPR names
+hpr-labels.json
+hpr-labels.json.tmp
+hpr-labels.corrupt

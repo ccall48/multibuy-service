@@ -730,3 +730,55 @@ async fn hotspots_endpoint_keeps_per_hotspot_stats() {
     let view: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(view["hotspots"][0]["denied_now"], true, "body was {body}");
 }
+
+#[tokio::test]
+async fn hpr_labels_can_be_set_and_removed() {
+    let settings = common::test_settings();
+    let grpc_addr = common::available_port().await;
+    let (_shutdown, api) = common::start_server_with_api(&settings, grpc_addr).await;
+
+    let (status, body) = common::http(
+        api,
+        "PUT",
+        "/api/v1/hpr-labels/3.72.47.84",
+        None,
+        Some(r#"{"label":" Frankfurt "}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "body was {body}");
+    assert!(
+        body.contains(r#""3.72.47.84":"Frankfurt""#),
+        "body was {body}"
+    );
+
+    let (_, body) = common::http(api, "GET", "/api/v1/hpr-labels", None, None).await;
+    assert!(
+        body.contains(r#""3.72.47.84":"Frankfurt""#),
+        "body was {body}"
+    );
+
+    // Bad input is rejected.
+    let (status, _) = common::http(
+        api,
+        "PUT",
+        "/api/v1/hpr-labels/not-an-ip",
+        None,
+        Some(r#"{"label":"x"}"#),
+    )
+    .await;
+    assert_eq!(status, 400);
+    let (status, _) = common::http(
+        api,
+        "PUT",
+        "/api/v1/hpr-labels/1.2.3.4",
+        None,
+        Some(r#"{"label":"  "}"#),
+    )
+    .await;
+    assert_eq!(status, 400);
+
+    let (status, body) =
+        common::http(api, "DELETE", "/api/v1/hpr-labels/3.72.47.84", None, None).await;
+    assert_eq!(status, 200, "body was {body}");
+    assert!(body.contains(r#""labels":{}"#), "body was {body}");
+}

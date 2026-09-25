@@ -10,6 +10,7 @@ pub mod settings;
 use crate::connections::{ConnectionEvent, Connections};
 use crate::deny_lists::{self, DenyListStore, DenyLists};
 use crate::hotspots::{HotspotView, Hotspots};
+use crate::hpr_labels::HprLabels;
 use crate::traffic::{self, Silence, Traffic};
 use axum::{
     extract::{Path, Query, Request, State},
@@ -36,6 +37,7 @@ pub struct ApiState {
     traffic: Arc<Traffic>,
     connections: Arc<Connections>,
     hotspots: Arc<Hotspots>,
+    hpr_labels: Arc<HprLabels>,
     metrics: PrometheusHandle,
     auth_token: Option<Arc<String>>,
     grpc_listen: SocketAddr,
@@ -59,6 +61,7 @@ impl ApiState {
             traffic: state.traffic(),
             connections: state.connections(),
             hotspots: state.hotspots(),
+            hpr_labels: state.hpr_labels(),
             metrics,
             auth_token: auth_token.map(Arc::new),
             grpc_listen,
@@ -82,6 +85,11 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/v1/traffic", get(get_traffic))
         .route("/api/v1/connections", get(get_connections))
         .route("/api/v1/hotspots", get(get_hotspot_stats))
+        .route("/api/v1/hpr-labels", get(get_hpr_labels))
+        .route(
+            "/api/v1/hpr-labels/{ip}",
+            axum::routing::put(set_hpr_label).delete(remove_hpr_label),
+        )
         .route("/api/v1/regions", get(known_regions))
         .route("/api/v1/animal-name/{hotspot}", get(lookup_animal_name))
         .route("/api/v1/deny-list", get(get_deny_list))
@@ -457,6 +465,64 @@ async fn get_hotspot_stats(
             })
             .collect(),
     }))
+}
+
+#[derive(Serialize)]
+struct HprLabelsView {
+    /// Canonical IP -> label.
+    labels: std::collections::BTreeMap<String, String>,
+    persistent: bool,
+}
+
+fn hpr_labels_view(labels: &HprLabels) -> Json<HprLabelsView> {
+    Json(HprLabelsView {
+        labels: labels.all(),
+        persistent: labels.is_persistent(),
+    })
+}
+
+/// Names given to HPR addresses; the dashboard shows these instead of the IP.
+async fn get_hpr_labels(State(state): State<ApiState>) -> Json<HprLabelsView> {
+    hpr_labels_view(&state.hpr_labels)
+}
+
+#[derive(Deserialize)]
+struct HprLabelBody {
+    label: String,
+}
+
+async fn set_hpr_label(
+    State(state): State<ApiState>,
+    Path(ip): Path<String>,
+    Json(body): Json<HprLabelBody>,
+) -> Result<Json<HprLabelsView>, ApiError> {
+    crate::hpr_labels::validate(&ip, &body.label)
+        .map_err(|e| ApiError::bad_request(e.to_string(), vec![]))?;
+    // Input is valid, so an error now is the save failing; the label is live.
+    state.hpr_labels.set(&ip, &body.label).map_err(|e| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("label applied but not saved, so it will be lost on restart: {e}"),
+        )
+    })?;
+    tracing::info!(ip, label = body.label.trim(), "HPR label set");
+    Ok(hpr_labels_view(&state.hpr_labels))
+}
+
+async fn remove_hpr_label(
+    State(state): State<ApiState>,
+    Path(ip): Path<String>,
+) -> Result<Json<HprLabelsView>, ApiError> {
+    crate::hpr_labels::canonical_ip(&ip)
+        .map_err(|e| ApiError::bad_request(e.to_string(), vec![]))?;
+    state.hpr_labels.remove(&ip).map_err(|e| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("label removed but not saved, so it will return on restart: {e}"),
+        )
+    })?;
+    tracing::info!(ip, "HPR label removed");
+    Ok(hpr_labels_view(&state.hpr_labels))
 }
 
 #[derive(Serialize)]

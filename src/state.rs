@@ -2,6 +2,7 @@ use crate::cache::Cache;
 use crate::connections::Connections;
 use crate::deny_lists::{DenyListStore, DenyLists};
 use crate::hotspots::{HotspotStore, Hotspots};
+use crate::hpr_labels::HprLabels;
 use crate::settings::Settings;
 use crate::traffic::Traffic;
 use helium_proto::services::multi_buy::{multi_buy_server, MultiBuyIncReqV1, MultiBuyIncResV1};
@@ -15,6 +16,7 @@ pub struct State {
     traffic: Arc<Traffic>,
     connections: Arc<Connections>,
     hotspots: Arc<Hotspots>,
+    hpr_labels: Arc<HprLabels>,
 }
 
 impl State {
@@ -71,6 +73,7 @@ impl State {
             traffic: Arc::new(Traffic::new(settings.lns_dedup_window)),
             connections: Arc::new(Connections::new()),
             hotspots: Arc::new(Hotspots::load(HotspotStore::new(&settings.hotspot_store))),
+            hpr_labels: Arc::new(HprLabels::load(&settings.hpr_label_store)),
         })
     }
 
@@ -106,6 +109,11 @@ impl State {
     pub fn hotspots(&self) -> Arc<Hotspots> {
         self.hotspots.clone()
     }
+
+    /// Operator-assigned HPR names, for the admin API.
+    pub fn hpr_labels(&self) -> Arc<HprLabels> {
+        self.hpr_labels.clone()
+    }
 }
 
 #[tonic::async_trait]
@@ -117,7 +125,8 @@ impl multi_buy_server::MultiBuy for State {
         let start = std::time::Instant::now();
         crate::metrics::increment_hit();
 
-        let peer = request.remote_addr().map(|addr| addr.ip());
+        // Canonical form, so an IPv4 peer on a dual-stack socket matches its label.
+        let peer = request.remote_addr().map(|addr| addr.ip().to_canonical());
         let multi_buy_req = request.into_inner();
         // Records a hit against each entry that matched, so the admin API can
         // report which rules are actually doing work.

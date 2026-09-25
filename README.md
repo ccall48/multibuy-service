@@ -104,6 +104,10 @@ grpc_listen = "0.0.0.0:6080"
 # Env: MB__HOTSPOT_STORE
 # hotspot_store = "hotspots.json"
 
+# Names given to HPR addresses on the dashboard ("" = memory only)
+# Env: MB__HPR_LABEL_STORE
+# hpr_label_store = "hpr-labels.json"
+
 # Prometheus metrics endpoint
 [metrics]
 # Env: MB__METRICS__ENDPOINT
@@ -145,6 +149,7 @@ listen = "0.0.0.0:6081"
 | `MB__API__AUTH_TOKEN` | Bearer token required on API requests | unset (no auth) |
 | `MB__DENY_LIST_STORE` | Where API deny-list changes are persisted (`""` disables) | `deny-list.json` |
 | `MB__HOTSPOT_STORE` | Where per-hotspot stats are saved (`""` disables) | `hotspots.json` |
+| `MB__HPR_LABEL_STORE` | Where HPR names set on the dashboard are saved (`""` disables) | `hpr-labels.json` |
 
 ## Metrics
 
@@ -249,6 +254,9 @@ token is configured. `/` and `/health` are always open.
 | `GET` | `/api/v1/metrics` | Prometheus payload, rendered in-process |
 | `GET` | `/api/v1/traffic?min_gap=10` | Requests per second for the last hour, runs of `min_gap`+ seconds with none (e.g. HPR backing off), copies arriving after the LNS dedup window, device resends and slow-hotspot copies (3s+), requests per HPR address, and the hotspots delivering late |
 | `GET` | `/api/v1/hotspots?sort=copies&q=&limit=100` | Every hotspot seen, with copies, arrival position, delay, late/slow/resend counts, denials and regions. `sort`: copies, recent, late, delay, first_seen, name |
+| `GET` | `/api/v1/hpr-labels` | Names given to HPR IPs |
+| `PUT` | `/api/v1/hpr-labels/{ip}` | Name an HPR: `{"label":"Frankfurt"}` |
+| `DELETE` | `/api/v1/hpr-labels/{ip}` | Clear an HPR's name |
 | `GET` | `/api/v1/connections` | gRPC client connects/disconnects, with how long each was open and why it closed |
 | `GET` | `/api/v1/regions` | Every region name the proto accepts |
 | `GET` | `/api/v1/animal-name/{key}` | Animal name for an address, without changing anything |
