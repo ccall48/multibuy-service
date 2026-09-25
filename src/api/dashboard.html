@@ -159,6 +159,15 @@
   .hotspots td.name { font-family: inherit; font-size: 13px; word-break: normal; }
   .hotspots td button { padding: 3px 9px; font-size: 12px; }
   .hotspots td .denied { color: var(--bad); font-size: 11px; }
+  .addr-line { display: flex; align-items: center; gap: 8px; margin-top: 1px; }
+  button.linkish { background: none; border: 0; padding: 0; color: var(--accent); font-size: 11px;
+                   font-weight: 400; cursor: pointer; }
+  button.linkish:hover { text-decoration: underline; filter: none; }
+  a.geek { display: inline-flex; color: var(--muted); }
+  a.geek:hover { color: var(--accent); }
+  .addr[hidden] { display: none; }
+  .traffic .strip-label.clickable { cursor: pointer; }
+  .traffic .strip-label.clickable:hover { fill: var(--text); }
   details.raw { margin-top: 28px; }
   details.raw summary { cursor: pointer; color: var(--muted); font-size: 13px; }
   details.raw pre { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
@@ -220,7 +229,7 @@
       <table id="silence-table"><tbody></tbody></table>
       <h3>Hotspots delivering late <span style="font-weight:400">— since the service started</span></h3>
       <table id="late-hotspot-table"><tbody></tbody></table>
-      <h3>Connections</h3>
+      <h3>Connections <span style="font-weight:400">— HPR locations from ipinfo.io, looked up by this browser</span></h3>
       <table id="conn-table"><tbody></tbody></table>
       <div class="hint">HPR stops calling this service for a route while it backs off after a failed request
         (1s, doubling to 5 min). With <code>fail_on_unavailable</code> on, it drops those packets, so they
@@ -481,7 +490,7 @@ function renderList(kind, entries) {
   const isHotspot = kind === "hotspot";
   list.innerHTML = entries.map(() =>
     "<li><div class='entry'><div class='primary'></div>" +
-    (isHotspot ? "<div class='addr'></div>" : "") +
+    (isHotspot ? "<div class='addr-wrap'></div>" : "") +
     "</div><div class='hits'><span class='n'></span><span class='when'></span></div>" +
     "<button class='ghost'>Remove</button></li>").join("");
   // Values go in via textContent, never interpolated into HTML.
@@ -492,7 +501,7 @@ function renderList(kind, entries) {
     if (isHotspot) {
       primary.textContent = entry.name || "(unnamed)";
       primary.className = "primary animal";
-      li.querySelector(".addr").textContent = entry.address;
+      li.querySelector(".addr-wrap").innerHTML = hotspotAddr(entry.address);
     } else {
       primary.textContent = entry.region;
     }
@@ -507,6 +516,120 @@ function renderList(kind, entries) {
     li.querySelector("button").onclick = () => removeEntry(kind, value);
   });
 }
+
+// ------------------------------------------------------------ privacy & links
+
+// Everything from the API that lands in HTML goes through this.
+const esc = (v) => String(v).replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+
+// Hotspot addresses and HPR IPs are hidden until clicked. What's been revealed
+// is remembered for this page load so the 5s refresh doesn't hide it again.
+const shownAddrs = new Set();
+const shownIps = new Set();
+
+const GEEK_ICON = '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">' +
+  '<path d="M6.5 3H3v10h10V9.5M9.5 3H13v3.5M13 3 7.5 8.5" fill="none" stroke="currentColor" ' +
+  'stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+
+// A hotspot's address line: reveal toggle, HeliumGeek link, and the address
+// itself (hidden until revealed).
+function hotspotAddr(address) {
+  const shown = shownAddrs.has(address);
+  return '<div class="addr-line"><button type="button" class="linkish" data-reveal-addr="' + esc(address) +
+    '" aria-expanded="' + shown + '">' + (shown ? "hide address" : "show address") + "</button>" +
+    '<a class="geek" href="https://app.heliumgeek.com/hotspots/' + encodeURIComponent(address) +
+    '" target="_blank" rel="noopener noreferrer" title="View on HeliumGeek" aria-label="View on HeliumGeek">' +
+    GEEK_ICON + "</a></div>" +
+    '<div class="addr" data-addr="' + esc(address) + '"' + (shown ? "" : " hidden") + ">" + esc(address) + "</div>";
+}
+
+// Toggle in place rather than re-rendering, so a click never races a refresh.
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-reveal-addr]");
+  if (!btn) return;
+  const address = btn.dataset.revealAddr;
+  const shown = !shownAddrs.has(address);
+  if (shown) shownAddrs.add(address); else shownAddrs.delete(address);
+  const sel = CSS.escape(address);
+  document.querySelectorAll('.addr[data-addr="' + sel + '"]').forEach((el) => { el.hidden = !shown; });
+  document.querySelectorAll('[data-reveal-addr="' + sel + '"]').forEach((b) => {
+    b.textContent = shown ? "hide address" : "show address";
+    b.setAttribute("aria-expanded", String(shown));
+  });
+});
+
+// HPR locations are looked up from the browser via ipinfo.io, cached in memory
+// and for a week in localStorage. Only HPR IPs are sent, and only while this
+// page is open.
+const GEO_TTL_MS = 7 * 24 * 3600 * 1000;
+const GEO_RETRY_MS = 10 * 60 * 1000;
+const geo = new Map();   // ip -> { label } | { pending: true } | { failedAt }
+
+function isPrivateIp(ip) {
+  return /^(10\.|127\.|0\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/.test(ip) ||
+    ip === "::1" || /^f[cd]/i.test(ip) || /^fe80:/i.test(ip);
+}
+
+// "1.2.3.4:5678" / "[::1]:5678" / "::ffff:1.2.3.4" -> bare IP.
+function bareIp(peer) {
+  let ip = peer.startsWith("[") ? peer.slice(1, peer.indexOf("]")) : peer;
+  if (!peer.startsWith("[") && (ip.match(/:/g) || []).length === 1) ip = ip.slice(0, ip.lastIndexOf(":"));
+  return ip.replace(/^::ffff:/i, "");
+}
+
+function geoLabel(ip) {
+  if (isPrivateIp(ip)) return "private network";
+  const entry = geo.get(ip);
+  if (entry && entry.label) return entry.label;
+  if (entry && entry.pending) return "locating…";
+  if (entry && Date.now() - entry.failedAt < GEO_RETRY_MS) return "location unknown";
+  try {
+    const cached = JSON.parse(localStorage.getItem("mb_geo_" + ip) || "null");
+    if (cached && Date.now() - cached.at < GEO_TTL_MS) {
+      geo.set(ip, { label: cached.label });
+      return cached.label;
+    }
+  } catch (_) {}
+  lookupGeo(ip);
+  return "locating…";
+}
+
+async function lookupGeo(ip) {
+  geo.set(ip, { pending: true });
+  try {
+    const res = await fetch("https://ipinfo.io/" + encodeURIComponent(ip) + "/json");
+    if (!res.ok) throw new Error(res.status);
+    const d = await res.json();
+    const label = [d.city, d.region, d.country].filter(Boolean).join(", ") || "location unknown";
+    geo.set(ip, { label });
+    try { localStorage.setItem("mb_geo_" + ip, JSON.stringify({ label, at: Date.now() })); } catch (_) {}
+  } catch (_) {
+    geo.set(ip, { failedAt: Date.now() });
+  }
+  renderTraffic();   // also re-renders the connections table
+}
+
+// How an HPR is named on the page: its location, plus the IP once revealed.
+function hprText(peer) {
+  const ip = bareIp(peer);
+  return geoLabel(ip) + (shownIps.has(ip) ? " · " + peer : "");
+}
+
+function hprReveal(peer) {
+  const ip = bareIp(peer);
+  const shown = shownIps.has(ip);
+  return '<button type="button" class="linkish" data-reveal-ip="' + esc(ip) + '" aria-expanded="' + shown + '">' +
+    (shown ? "hide IP" : "show IP") + "</button>";
+}
+
+document.addEventListener("click", (e) => {
+  const el = e.target.closest("[data-reveal-ip]");
+  if (!el) return;
+  const ip = el.dataset.revealIp;
+  if (shownIps.has(ip)) shownIps.delete(ip); else shownIps.add(ip);
+  renderTraffic();
+});
 
 // `last_denied` is unix seconds from the server.
 function agoText(unixSeconds) {
@@ -539,7 +662,7 @@ async function removeEntry(kind, value) {
 // A mutation's `changed` list holds strings for regions, {address, name} for
 // hotspots — label the latter by animal name, which is what an operator reads.
 const labelChanged = (result) =>
-  (result.changed || []).map((c) => (typeof c === "string" ? c : c.name + " (" + c.address + ")"))
+  (result.changed || []).map((c) => (typeof c === "string" ? c : c.name || "(unnamed hotspot)"))
     .join(", ");
 
 function reportMutation(result, fallback) {
@@ -674,7 +797,8 @@ function renderTraffic() {
     { key: "late", label: "late copies > " + t.dedup_window_ms + "ms", vals: bucketed(t.late), cls: "late" },
     { key: "resend", label: "device resends ≥ " + repeatS + "s", vals: bucketed(t.resends), cls: "late" },
     { key: "slow", label: "slow hotspot ≥ " + repeatS + "s", vals: bucketed(t.slow_copies), cls: "late" },
-    ...(t.peers || []).map((p) => ({ key: "peer", label: "HPR " + p.ip, vals: bucketed(p.requests), cls: "peer" })),
+    ...(t.peers || []).map((p) => ({ key: "peer", ip: bareIp(p.ip), label: "HPR " + hprText(p.ip),
+      vals: bucketed(p.requests), cls: "peer" })),
   ];
   const top = 8, plotH = 130, stripH = 18, stripGap = 6, bottom = 22;
   let y = top + plotH + 8;
@@ -719,7 +843,11 @@ function renderTraffic() {
       svg += '<rect class="' + row.cls + '" x="' + (i * pitch + 1) + '" y="' + (row.y + stripH - h) + '" width="' + barW +
         '" height="' + h + '" rx="' + Math.min(1.5, barW / 2) + '"/>';
     });
-    svg += '<text class="strip-label" x="0" y="' + (row.y + 11) + '">' + row.label + ' · ' + fmt(row.total) + '</text>';
+    svg += row.ip
+      ? '<text class="strip-label clickable" data-reveal-ip="' + esc(row.ip) + '" x="0" y="' + (row.y + 11) + '">' +
+        esc(row.label) + ' · ' + fmt(row.total) + '<title>Click to ' + (shownIps.has(row.ip) ? "hide" : "show") +
+        ' IP</title></text>'
+      : '<text class="strip-label" x="0" y="' + (row.y + 11) + '">' + esc(row.label) + ' · ' + fmt(row.total) + '</text>';
   }
 
   // Connection opens/closes as thin full-height rules with a cap, drawn over
@@ -771,7 +899,7 @@ function renderTraffic() {
         ? '<small style="color:var(--late)">' + fmt(lateRow.vals[i]) + " late · " + fmt(resendRow.vals[i]) +
           " resent · " + fmt(slowRow.vals[i]) + " slow hotspot</small>" : "") +
       (peerRows.length > 1
-        ? "<small>" + peerRows.map((r) => r.label.slice(4) + " " + fmt(r.vals[i])).join(" · ") + "</small>" : "") +
+        ? "<small>" + peerRows.map((r) => esc(r.label.slice(4)) + " " + fmt(r.vals[i])).join(" · ") + "</small>" : "") +
       tipEvents(events.filter((ev) => ev.at >= b0 && ev.at < b0 + bucket));
     tip.style.display = "block";
     const hostRect = host.parentElement.getBoundingClientRect();
@@ -820,15 +948,15 @@ function renderLateHotspots() {
   tbody.innerHTML = list.length
     ? '<tr><th>Hotspot</th><th style="text-align:right">Late</th><th style="text-align:right">Slow ≥3s</th>' +
       '<th style="text-align:right">Resends</th><th>Last</th></tr>' +
-      list.map((h) => '<tr><td><div>' + (h.name || "–") + '</div><div class="peer">' + h.address + "</div></td>" +
+      list.map((h) => '<tr><td><div>' + esc(h.name || "–") + "</div>" + hotspotAddr(h.address) + "</td>" +
         '<td class="num">' + fmt(h.late) + '</td><td class="num">' + fmt(h.slow) + '</td><td class="num">' +
         fmt(h.resends) + "</td><td>" + agoText(h.last) + "</td></tr>").join("")
     : '<tr><td class="empty">No late, slow or resent copies yet.</td></tr>';
 }
 
 function connText(ev) {
-  if (ev.kind === "opened") return "connected " + ev.peer;
-  return "disconnected " + ev.peer + " — " + ev.reason + " (open " + durationText(ev.open_seconds) +
+  if (ev.kind === "opened") return "connected " + esc(hprText(ev.peer));
+  return "disconnected " + esc(hprText(ev.peer)) + " — " + esc(ev.reason) + " (open " + durationText(ev.open_seconds) +
     ", idle " + durationText(ev.idle_seconds) + ")";
 }
 
@@ -843,7 +971,8 @@ function renderConnections() {
     const label = ev.kind === "opened"
       ? '<span style="color:var(--ok)">● connected</span>'
       : '<span style="color:var(--bad)">● disconnected</span>';
-    return "<tr><td>" + clock(ev.at) + "</td><td>" + label + '<div class="peer">' + ev.peer +
+    return "<tr><td>" + clock(ev.at) + "</td><td>" + label + '<div class="peer">' + esc(hprText(ev.peer)) + " " +
+      hprReveal(ev.peer) +
       "</div></td><td>" + detail + "</td></tr>";
   });
   tbody.innerHTML = rows.length
@@ -891,9 +1020,9 @@ function renderHotspots(data) {
   tbody.innerHTML = head + data.hotspots.map((h) => {
     const raced = h.first + h.second + h.later;
     const action = h.denied_now
-      ? '<span class="denied">denied</span><br><button class="ghost" data-allow="' + h.address + '">Allow</button>'
-      : '<button class="ghost" data-deny="' + h.address + '">Deny</button>';
-    return '<tr><td class="name"><div>' + (h.name || "–") + '</div><div class="addr">' + h.address + "</div>" +
+      ? '<span class="denied">denied</span><br><button class="ghost" data-allow="' + esc(h.address) + '">Allow</button>'
+      : '<button class="ghost" data-deny="' + esc(h.address) + '" data-name="' + esc(h.name || "") + '">Deny</button>';
+    return '<tr><td class="name"><div>' + esc(h.name || "–") + "</div>" + hotspotAddr(h.address) +
       (h.denied ? '<span class="sub">' + fmt(h.denied) + " denied</span>" : "") + "</td>" +
       '<td class="num">' + fmt(h.copies) + '<span class="sub">' + fmt(h.copies_last_hour) + " last hr</span></td>" +
       '<td class="num">' + pct(h.first, raced) + '<span class="sub">' + fmt(h.first) + " · " + fmt(h.second) +
@@ -905,15 +1034,15 @@ function renderHotspots(data) {
       "<td>" + agoText(h.last_seen) + '<span class="sub">first ' + new Date(h.first_seen * 1000).toLocaleDateString() + "</span></td>" +
       "<td>" + action + "</td></tr>";
   }).join("");
-  tbody.querySelectorAll("button[data-deny]").forEach((b) => { b.onclick = () => denyHotspot(b.dataset.deny); });
+  tbody.querySelectorAll("button[data-deny]").forEach((b) => { b.onclick = () => denyHotspot(b.dataset.deny, b.dataset.name); });
   tbody.querySelectorAll("button[data-allow]").forEach((b) => {
     b.onclick = async () => { await removeEntry("hotspot", b.dataset.allow); loadHotspots().catch(() => {}); };
   });
 }
 
 // Denying drops every copy this hotspot sends from the next request on, so ask.
-async function denyHotspot(address) {
-  if (!window.confirm("Deny " + address + "?\n\nIts copies will be refused from the next request.")) return;
+async function denyHotspot(address, name) {
+  if (!window.confirm("Deny " + (name || "this hotspot") + "?\n\nIts copies will be refused from the next request.")) return;
   try {
     const result = await apiJson("/api/v1/deny-list/hotspots", {
       method: "POST", body: JSON.stringify({ hotspots: [address] }),
